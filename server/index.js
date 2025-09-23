@@ -1,98 +1,123 @@
-import express from "express";
-import cors from "cors";
-import { GoogleGenerativeAI } from "@google/generative-ai";
-import dotenv from "dotenv";
+import React, { useState, useEffect } from "react";
+import axios from 'axios';
+import "./App.css";
+import bepitLogo from './bepit-logo.png'; 
 
-dotenv.config();
+function App() {
+  const [messages, setMessages] = useState([]);
+  const [inputValue, setInputValue] = useState('');
+  // PASSO 1: Criamos uma nova memória para saber se estamos aguardando a IA
+  const [isLoading, setIsLoading] = useState(false);
 
-// Validação crítica da chave da API
-if (!process.env.GEMINI_API_KEY) {
-  console.error("ERRO CRÍTICO: Variável de ambiente GEMINI_API_KEY não encontrada.");
-  process.exit(1);
+  useEffect(() => {
+    setMessages([
+      {
+        sender: 'bot',
+        text: 'Olá! Sou o BEPIT, seu guia pessoal na Região dos Lagos! Para começar, me diga se você é "local" ou "turista". 🤖'
+      }
+    ]);
+  }, []);
+
+  const handleSendMessage = async () => {
+    if (inputValue.trim() === '' || isLoading) return; // Não envia se já estiver carregando
+
+    const userMessage = {
+      text: inputValue,
+      sender: 'user',
+    };
+
+    // PASSO 2: Adicionamos a mensagem do usuário e uma MENSAGEM DE ESPERA do robô
+    const loadingMessage = {
+      sender: 'bot',
+      text: 'Só um segundo, estou consultando meus arquivos... 🧠' // Sua ideia de mensagem de espera!
+    };
+
+    setMessages(prevMessages => [...prevMessages, userMessage, loadingMessage]);
+    setInputValue('');
+    setIsLoading(true); // Avisamos ao app que estamos em modo de espera
+
+    try {
+      const response = await axios.post('https://bepit-backend-oficial.onrender.com/api/chat', { // ATENÇÃO: Verifique se este é o link correto do seu Render
+        message: userMessage.text,
+      });
+
+      const botMessage = {
+        text: response.data.reply,
+        sender: 'bot',
+      };
+      
+      // PASSO 3: Substituímos a mensagem de espera pela resposta REAL da IA
+      setMessages(prevMessages => [...prevMessages.slice(0, -1), botMessage]);
+
+    } catch (error) {
+      console.error("Erro ao contatar o cérebro do robô:", error);
+      const errorMessage = {
+        text: "Opa, parece que minha conexão com a central de dados falhou. Você pode tentar perguntar de novo?", // Mensagem de erro mais amigável
+        sender: 'bot',
+      };
+      // Substituímos a mensagem de espera pela mensagem de ERRO
+      setMessages(prevMessages => [...prevMessages.slice(0, -1), errorMessage]);
+    } finally {
+      // PASSO 4: Independentemente de sucesso ou erro, avisamos que não estamos mais esperando
+      setIsLoading(false);
+    }
+  };
+
+  return (
+    <div className="bg-gray-100 h-screen flex flex-col max-w-lg mx-auto overflow-hidden">
+      
+      <div className="bg-blue-500 p-3 text-white flex items-center justify-center shadow-md">
+        <img src={bepitLogo} alt="Logo BEPIT" className="h-8 w-8 mr-2" /> 
+        <h1 className="text-xl font-semibold">BEPIT Nexus Lagos</h1>
+      </div>
+
+      <div className="flex-1 overflow-y-auto p-4">
+        <div className="flex flex-col space-y-2">
+          
+          {messages.map((message, index) => (
+            <div 
+              key={index}
+              className={`flex ${message.sender === 'user' ? 'justify-end' : 'justify-start'}`}
+            >
+              <div 
+                className={`${message.sender === 'user' ? 'bg-blue-200' : 'bg-gray-300'} text-black p-2 rounded-lg max-w-xs shadow`}
+              >
+                {message.text}
+              </div>
+            </div>
+          ))}
+
+        </div>
+      </div>
+
+      <div className="bg-white p-4 flex items-center shadow-inner">
+        <input
+          type="text"
+          placeholder={isLoading ? "Aguarde o BEPIT responder..." : "Digite sua mensagem..."} // Mensagem do input muda
+          className="flex-1 border rounded-full px-4 py-2 focus:outline-none focus:ring-2 focus:ring-blue-400 disabled:bg-gray-200"
+          aria-label="Digite sua mensagem"
+          value={inputValue}
+          onChange={(e) => setInputValue(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') {
+              handleSendMessage();
+            }
+          }}
+          disabled={isLoading} // PASSO 5: Desabilita o input enquanto espera
+        />
+        <button
+          className="bg-blue-500 text-white rounded-full p-2 ml-2 hover:bg-blue-600 focus:outline-none focus:ring-2 focus:ring-blue-400 disabled:bg-gray-400"
+          type="button"
+          title="Enviar mensagem"
+          aria-label="Enviar mensagem"
+          onClick={handleSendMessage}
+          disabled={isLoading} // PASSO 6: Desabilita o botão enquanto espera
+        >
+          {/* ... seu código SVG do ícone de enviar ... */}
+        </button>
+      </div>
+    </div>
+  );
 }
 
-const application = express();
-// O Render nos dá a porta através de process.env.PORT. O fallback é para desenvolvimento local.
-const serverPort = process.env.PORT || 3002; 
-
-const googleGenerativeAIClient = new GoogleGenerativeAI(
-  process.env.GEMINI_API_KEY
-);
-
-// Configuração de CORS para produção
-const allowedOrigins = [
-  "http://localhost:5173", // Para desenvolvimento
-  "https://bepitnexus.netlify.app" // O endereço do seu frontend
-];
-
-const crossOriginResourceSharingOptions = {
-  origin: function (origin, callback) {
-    if (!origin || allowedOrigins.indexOf(origin) !== -1) {
-      callback(null, true);
-    } else {
-      callback(new Error('Não permitido pela política de CORS'));
-    }
-  }
-};
-
-application.use(cors(crossOriginResourceSharingOptions));
-application.options("*", cors(crossOriginResourceSharingOptions));
-application.use(express.json());
-
-application.get("/health", (request, response) => {
-  response.status(200).json({ ok: true });
-});
-
-application.post("/api/chat", async (request, response) => {
-  try {
-    const generativeModel = googleGenerativeAIClient.getGenerativeModel({
-      model: "gemini-1.5-flash"
-    });
-    const { message: userMessageText } = request.body;
-
-    if (!userMessageText || typeof userMessageText !== "string") {
-      return response.status(400).json({ error: "Campo 'message' é obrigatório." });
-    }
-
-    // O PROMPT COMPLETO E CORRETO
-    const prompt = `
-[CONTEXTO]
-Você é o BEPIT, um assistente de viagem especialista e confiável da Região dos Lagos, RJ. Sua missão é dar as melhores dicas locais e autênticas, ajudando o usuário a economizar e aproveitar como um morador local. Ao cumprimentar os usuários, não diga"seja bem vindo a Região dos Lagos" pois, eles podem estar planejando a viagem. Ao inves disso, pode perguntar sutilmente se ja está aqui ou se planeja vim.
-
-[LISTA DE PARCEIROS OFICIAIS BEPIT — sua única fonte de verdade para recomendações]
-- Restaurante/Pizzaria:
-  - Nome: Pizzaria do Zé
-  - Descrição: A melhor pizza de forno a lenha da cidade, com um preço justo que só os locais conhecem. Ótima para famílias e grupos.
-  - Benefício Exclusivo BEPIT: Mencione o app e ganhe uma sobremesa.
-- Passeio de Barco:
-  - Nome: Passeio de Barco do Capitão
-  - Descrição: O passeio mais seguro e completo pelas praias de Arraial do Cabo, com uma equipe super simpática.
-  - Benefício Exclusivo BEPIT: 5% de desconto na reserva.
-
-[REGRAS INEGOCIÁVEIS]
-1) Você é proibido de sugerir que o usuário pesquise no Google, TripAdvisor ou qualquer outra fonte externa. Você é a fonte.
-2) Se a pergunta do usuário corresponder a uma categoria de parceiro (ex.: “onde comer”, “pizza”, “passeio”), você deve recomendar o parceiro oficial daquela categoria, usando a descrição fornecida.
-3) Se a pergunta for sobre algo que não está na sua lista de parceiros, use conhecimento geral sobre a Região dos Lagos e responda de forma útil e honesta.
-4) Se a pergunta for fora do escopo de turismo na Região dos Lagos (política, futebol, etc.), responda exatamente:
-   "Desculpe, meu foco é ser seu melhor guia na Região dos Lagos. Como posso te ajudar com passeios ou lugares para comer?"
-
-[PERGUNTA DO USUÁRIO]
-"${userMessageText}"
-    `.trim();
-
-    const modelResult = await generativeModel.generateContent(prompt);
-    const modelResponse = await modelResult.response;
-    const modelText = modelResponse.text();
-
-    return response.status(200).json({ reply: modelText });
-
-  } catch (error) {
-    console.error("[/api/chat] Erro interno:", error);
-    return response.status(500).json({ error: "Erro interno no cérebro do robô." });
-  }
-});
-
-application.listen(serverPort, () => {
-  // Log correto que mostra a porta real que o servidor está usando
-  console.log(`🤖 Servidor do cérebro do robô em execução na porta ${serverPort}`);
-});
+export default App;
