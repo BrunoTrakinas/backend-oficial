@@ -108,5 +108,5 @@ application.use((request, response) => {
 });
 
 application.listen(serverPort, () => {
-  console.log(`🤖 Servidor do cérebro do robô em execução em http://localhost:${serverPort}`);
+  console.log(`🤖 Servidor do cérebro do robô em execução em http://localhost:10000`);
 });
