@@ -28,6 +28,7 @@ const allowedOrigins = [
   "http://localhost:5173",
   "https://bepitnexus.netlify.app"
 ];
+
 const crossOriginResourceSharingOptions = {
   origin: function (origin, callback) {
     if (!origin || allowedOrigins.indexOf(origin) !== -1) {
@@ -37,58 +38,61 @@ const crossOriginResourceSharingOptions = {
     }
   }
 };
+
 application.use(cors(crossOriginResourceSharingOptions));
 application.options("*", cors(crossOriginResourceSharingOptions));
 application.use(express.json());
 
+// Rota de saúde para testes
 application.get("/health", (request, response) => {
   response.status(200).json({ ok: true });
 });
 
-// A ROTA AGORA É DINÂMICA E RECEBE O "slug" DA REGIÃO
+// Rota de chat multi-região
 application.post("/api/chat/:slugDaRegiao", async (request, response) => {
   try {
-    const { slugDaRegiao } = request.params; // 1. Capturamos a região da URL
+    const { slugDaRegiao } = request.params;
     const { message: userMessageText } = request.body;
 
     if (!userMessageText || typeof userMessageText !== "string") {
       return response.status(400).json({ error: "Campo 'message' é obrigatório." });
     }
-
-    // 2. Buscamos as informações da região no banco de dados
+    
     const { data: regiao, error: regiaoError } = await supabase
       .from('regioes')
       .select('id, nome_regiao')
       .eq('slug', slugDaRegiao)
-      .single(); // .single() garante que pegamos apenas um resultado
+      .single();
 
     if (regiaoError || !regiao) {
-      console.error(`Região com slug '${slugDaRegiao}' não encontrada.`);
-      return response.status(404).json({ error: "Região não encontrada." });
+      throw new Error(`Região '${slugDaRegiao}' não encontrada.`);
     }
 
     const generativeModel = googleGenerativeAIClient.getGenerativeModel({ model: "gemini-1.5-flash" });
 
-    // Lógica de extração de palavras-chave (permanece igual)
-    const keywordExtractionPrompt = `Extraia até 3 palavras-chave de busca (tags) da seguinte frase, relacionadas a turismo. Responda apenas com as palavras separadas por vírgula. Frase: "${userMessageText}"`;
-    const keywordResult = await generativeModel.generateContent(keywordExtractionPrompt);
-    const keywordsText = await keywordResult.response.text();
-    const keywords = keywordsText.split(',').map(kw => kw.trim().toLowerCase()).filter(kw => kw);
+    // PROMPT DE EXTRAÇÃO DE TAGS (VERSÃO ROBUSTA E CORRIGIDA)
+    const keywordExtractionPrompt = `Sua única tarefa é extrair até 3 palavras-chave de busca (tags) da frase do usuário abaixo, relacionadas a turismo. Responda APENAS com as palavras separadas por vírgula, sem nenhuma outra frase ou explicação. Se não encontrar nenhuma tag relevante, responda com a palavra "geral".
+Exemplo 1: "onde comer uma pizza boa?" -> "pizza, restaurante, comer"
+Exemplo 2: "qual a história da cidade?" -> "geral"
+Frase: "${userMessageText}"`;
 
-    // 3. A busca de parceiros agora filtra pela região correta
-    let parceiros = [];
-    if (keywords.length > 0) {
-      const { data, error } = await supabase
-        .from('parceiros')
-        .select('nome, descricao, beneficio_bepit, endereco, faixa_preco, contato_telefone, link_fotos')
-        .eq('regiao_id', regiao.id) // << FILTRO CRUCIAL PELA REGIÃO!
-        .or(`tags.cs.{${keywords.join(',')}}`); // Busca por tags
-      
-      if (error) throw error;
-      parceiros = data;
+    const keywordResult = await generativeModel.generateContent(keywordExtractionPrompt);
+    const keywordsText = (await keywordResult.response.text()).trim();
+    const firstLineOfKeywords = keywordsText.split('\n')[0];
+    const keywords = firstLineOfKeywords.split(',').map(kw => kw.trim().toLowerCase());
+
+    // BUSCA DE PARCEIROS NO SUPABASE
+    const { data: parceiros, error } = await supabase
+      .from('parceiros')
+      .select('nome, descricao, beneficio_bepit, endereco, faixa_preco, contato_telefone, link_fotos')
+      .eq('regiao_id', regiao.id)
+      .or(`tags.cs.{${keywords.join(',')}}`);
+
+    if (error) {
+        console.error("Erro ao buscar parceiros no Supabase:", error);
+        throw new Error("Falha ao consultar o banco de dados.");
     }
-    
-    // Lógica para montar o contexto dos parceiros (permanece igual)
+
     let parceirosContexto = "Nenhum parceiro específico encontrado em nossa base de dados para esta pergunta.";
     if (parceiros && parceiros.length > 0) {
       parceirosContexto = "Baseado na sua pergunta, encontrei estes parceiros oficiais no nosso banco de dados:\n" + parceiros.map(p => 
@@ -96,22 +100,22 @@ application.post("/api/chat/:slugDaRegiao", async (request, response) => {
       ).join('\n\n');
     }
 
-    // 4. O prompt agora é dinâmico, mencionando a região correta!
+    // PROMPT FINAL E COMPLETO PARA A IA
     const finalPrompt = `
-      [CONTEXTO]
-      Você é o BEPIT, um assistente de viagem especialista e confiável da **${regiao.nome_regiao}**.
+[CONTEXTO]
+Você é o BEPIT, um assistente de viagem especialista e confiável da ${regiao.nome_regiao}. Sua missão é dar as melhores dicas locais e autênticas, ajudando o usuário a economizar e aproveitar como um morador local.
 
-      [PARCEIROS RELEVANTES ENCONTRADOS NO BANCO DE DADOS]
-      ${parceirosContexto}
+[PARCEIROS RELEVANTES ENCONTRADOS NO BANCO DE DADOS]
+${parceirosContexto}
 
-      [REGRAS INEGOCIÁVEIS]
-      1. Se a lista de parceiros relevantes não estiver vazia, BASEIE SUA RESPOSTA nela. Responda de forma conversada.
-      2. Você é proibido de sugerir que o usuário pesquise em outras fontes. VOCÊ é a fonte.
-      3. Se a lista de parceiros relevantes estiver vazia, use seu conhecimento geral para ajudar o usuário.
-      4. Responda APENAS sobre turismo na ${regiao.nome_regiao}. Para outros assuntos, recuse educadamente.
+[REGRAS INEGOCIÁVEIS]
+1. Se a lista de parceiros relevantes não estiver vazia, BASEIE SUA RESPOSTA nela. Responda de forma conversada, não como uma lista.
+2. Você é proibido de sugerir que o usuário pesquise em outras fontes. VOCÊ é a fonte.
+3. Se a lista de parceiros relevantes estiver vazia, use seu conhecimento geral para ajudar o usuário de forma honesta.
+4. Responda APENAS sobre turismo na ${regiao.nome_regiao}. Para outros assuntos, recuse educadamente com a frase: 'Desculpe, meu foco é ser seu melhor guia. Como posso te ajudar com passeios ou lugares para comer?'
 
-      [PERGUNTA DO USUÁRIO]
-      "${userMessageText}"
+[PERGUNTA DO USUÁRIO]
+"${userMessageText}"
     `.trim();
 
     const modelResult = await generativeModel.generateContent(finalPrompt);
@@ -127,5 +131,5 @@ application.post("/api/chat/:slugDaRegiao", async (request, response) => {
 });
 
 application.listen(serverPort, () => {
-  console.log(`🤖 Cérebro OFICIAL do BEPIT Nexus (Multi-Região) rodando na porta ${serverPort}`);
+  console.log(`🤖 Cérebro OFICIAL do BEPIT Nexus (v3) rodando na porta ${serverPort}`);
 });
