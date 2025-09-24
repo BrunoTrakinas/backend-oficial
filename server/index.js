@@ -73,7 +73,7 @@ application.post("/api/chat/:slugDaRegiao", async (request, response) => {
     
     const { data: parceiros, error } = await supabase
       .from('parceiros')
-      .select('nome, descricao, beneficio_bepit, endereco, faixa_preco, contato_telefone') // Busca todos os dados relevantes
+      .select('nome, descricao, beneficio_bepit, endereco, faixa_preco, contato_telefone, link_fotos')
       .eq('regiao_id', regiao.id)
       .or(`tags.cs.{${keywords.join(',')}}`);
 
@@ -84,9 +84,8 @@ application.post("/api/chat/:slugDaRegiao", async (request, response) => {
 
     let parceirosContexto = "Nenhum parceiro específico encontrado em nossa base de dados para esta pergunta.";
     if (parceiros && parceiros.length > 0) {
-      // Incluímos todos os novos campos no contexto para a IA
       parceirosContexto = "Baseado na sua pergunta, encontrei estes parceiros oficiais no nosso banco de dados:\n" + parceiros.map(p => 
-        `- Nome: ${p.nome}\n  - Descrição: ${p.descricao}\n  - Endereço: ${p.endereco}\n  - Faixa de Preço: ${p.faixa_preco}\n  - Contato: ${p.contato_telefone}\n  - Benefício Exclusivo BEPIT: ${p.beneficio_bepit}`
+        `- Nome: ${p.nome}\n  - Descrição: ${p.descricao}\n  - Endereço: ${p.endereco}\n  - Faixa de Preço: ${p.faixa_preco}\n  - Contato: ${p.contato_telefone}\n  - Benefício Exclusivo BEPIT: ${p.beneficio_bepit}\n  - Links de Fotos: ${p.link_fotos && p.link_fotos.length > 0 ? 'Sim, existem fotos disponíveis.' : 'Nenhuma foto disponível'}`
       ).join('\n\n');
     }
 
@@ -105,8 +104,9 @@ ${parceirosContexto}
 4. INFORMAÇÕES EXTERNAS (METEOROLOGIA E EVENTOS):
    - METEOROLOGIA: Você está autorizado a buscar e informar dados de meteorologia (temperatura da água, risco de geada, etc.), sempre citando que são "previsões de sites especializados".
    - EVENTOS: Se a pergunta for sobre eventos (shows, teatro), priorize parceiros do banco de dados. Se não houver, você pode buscar em fontes externas, mas DEVE AVISAR o usuário: "Encontrei este evento em uma fonte externa, mas como não é um parceiro oficial, não posso garantir que a informação esteja 100% atualizada."
-5. FOCO NO ESCOPO: Responda APENAS sobre turismo na ${regiao.nome_regiao}. Para outros assuntos, recuse educadamente com a frase: 'Desculpe, meu foco é ser seu melhor guia na ${regiao.nome_regiao}. Como posso te ajudar com passeios ou lugares para comer?'
-6. RECOMENDAÇÃO DE PARCEIROS: Se a pergunta do usuário corresponder a uma categoria de parceiro encontrada no banco de dados, BASEIE SUA RESPOSTA neles.
+5. FOTOS E VÍDEOS: Se os dados de um parceiro contiverem "Links de Fotos", mencione proativamente que você tem imagens do local e pergunte se o usuário gostaria de vê-las. Se o usuário pedir fotos, sua resposta DEVE ser apenas o texto "Claro, aqui estão as fotos que encontrei:", sem listar os links.
+6. FOCO NO ESCOPO: Responda APENAS sobre turismo na ${regiao.nome_regiao}. Para outros assuntos, recuse educadamente com a frase: 'Desculpe, meu foco é ser seu melhor guia na ${regiao.nome_regiao}. Como posso te ajudar com passeios ou lugares para comer?'
+7. RECOMENDAÇÃO DE PARCEIROS: Se a pergunta do usuário corresponder a uma categoria de parceiro encontrada no banco de dados, BASEIE SUA RESPOSTA neles.
 
 [PERGUNTA DO USUÁRIO]
 "${userMessageText}"
@@ -115,6 +115,8 @@ ${parceirosContexto}
     const modelResult = await generativeModel.generateContent(finalPrompt);
     const modelResponse = await modelResult.response;
     const modelText = modelResponse.text();
+
+    const photoLinks = parceiros ? parceiros.flatMap(p => p.link_fotos || []) : [];
 
     const { data: newInteraction, error: insertError } = await supabase.from('interacoes').insert({
       regiao_id: regiao.id,
@@ -129,7 +131,8 @@ ${parceirosContexto}
 
     return response.status(200).json({ 
       reply: modelText,
-      interactionId: newInteraction?.id
+      interactionId: newInteraction?.id,
+      photoLinks: photoLinks
     });
 
   } catch (error) {
