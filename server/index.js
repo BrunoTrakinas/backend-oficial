@@ -64,10 +64,7 @@ application.post("/api/chat/:slugDaRegiao", async (request, response) => {
 
     const generativeModel = googleGenerativeAIClient.getGenerativeModel({ model: "gemini-1.5-flash" });
 
-    const keywordExtractionPrompt = `Sua única tarefa é extrair até 3 palavras-chave de busca (tags) da frase do usuário abaixo, relacionadas a turismo. Responda APENAS com as palavras separadas por vírgula, sem nenhuma outra frase ou explicação. Se não encontrar nenhuma tag, responda com a palavra "geral".
-Exemplo 1: "onde comer uma pizza boa?" -> "pizza, restaurante, comer"
-Exemplo 2: "qual a história da cidade?" -> "geral"
-Frase: "${userMessageText}"`;
+    const keywordExtractionPrompt = `Sua única tarefa é extrair até 3 palavras-chave de busca (tags) da frase do usuário abaixo, relacionadas a turismo. Responda APENAS com as palavras separadas por vírgula, sem nenhuma outra frase ou explicação. Se não encontrar nenhuma tag, responda com a palavra "geral". Exemplo: "onde comer uma pizza boa?" -> "pizza, restaurante, comer". Frase: "${userMessageText}"`;
     
     const keywordResult = await generativeModel.generateContent(keywordExtractionPrompt);
     const keywordsText = (await keywordResult.response.text()).trim();
@@ -76,7 +73,7 @@ Frase: "${userMessageText}"`;
     
     const { data: parceiros, error } = await supabase
       .from('parceiros')
-      .select('nome, descricao, beneficio_bepit, endereco, faixa_preco, contato_telefone, link_fotos')
+      .select('nome, descricao, beneficio_bepit, endereco, faixa_preco, contato_telefone') // Busca todos os dados relevantes
       .eq('regiao_id', regiao.id)
       .or(`tags.cs.{${keywords.join(',')}}`);
 
@@ -87,23 +84,29 @@ Frase: "${userMessageText}"`;
 
     let parceirosContexto = "Nenhum parceiro específico encontrado em nossa base de dados para esta pergunta.";
     if (parceiros && parceiros.length > 0) {
+      // Incluímos todos os novos campos no contexto para a IA
       parceirosContexto = "Baseado na sua pergunta, encontrei estes parceiros oficiais no nosso banco de dados:\n" + parceiros.map(p => 
-        `- Nome: ${p.nome}\n  - Descrição: ${p.descricao}\n  - Benefício Exclusivo BEPIT: ${p.beneficio_bepit}\n  - Endereço: ${p.endereco}`
+        `- Nome: ${p.nome}\n  - Descrição: ${p.descricao}\n  - Endereço: ${p.endereco}\n  - Faixa de Preço: ${p.faixa_preco}\n  - Contato: ${p.contato_telefone}\n  - Benefício Exclusivo BEPIT: ${p.beneficio_bepit}`
       ).join('\n\n');
     }
 
+    // O prompt final e mais completo que definimos
     const finalPrompt = `
 [CONTEXTO]
-Você é o BEPIT, um assistente de viagem especialista e confiável da ${regiao.nome_regiao}. Sua missão é dar as melhores dicas locais e autênticas, ajudando o usuário a economizar e aproveitar como um morador local.
+Você é o BEPIT, um assistente de viagem especialista, confiável e SINCERO da ${regiao.nome_regiao}. Sua missão é dar as melhores dicas locais e autênticas, ajudando o usuário a economizar e aproveitar como um morador local.
 
 [PARCEIROS RELEVANTES ENCONTRADOS NO BANCO DE DADOS]
 ${parceirosContexto}
 
-[REGRAS INEGOCIÁVEIS]
-1. Se a lista de parceiros relevantes não estiver vazia, BASEIE SUA RESPOSTA nela. Responda de forma conversada.
-2. Você é proibido de sugerir que o usuário pesquise em outras fontes. VOCÊ é a fonte.
-3. Se a lista de parceiros relevantes estiver vazia, use seu conhecimento geral para ajudar o usuário.
-4. Responda APENAS sobre turismo na ${regiao.nome_regiao}. Para outros assuntos, recuse educadamente.
+[REGRAS INEGOCIÁVEIS DE COMPORTAMENTO E PERSONALIDADE]
+1. HONESTIDADE ACIMA DE TUDO: Nunca invente uma resposta que não seja verdade (ex: dizer que um lugar não tem problemas de segurança, se tiver). Sempre priorize a segurança e o bem-estar do usuário. Baseie suas afirmações em fatos e nos dados dos parceiros.
+2. CONCISÃO E SINCERIDADE: Suas respostas devem ser curtas e diretas, mas com um tom amigável e seguro. O objetivo é ser útil, não um poeta. O tamanho da resposta deve ser o mínimo necessário para ser completo.
+3. SIGILO COMERCIAL: Nossos parceiros são selecionados a dedo. Se o usuário perguntar por que você os recomenda ou se eles pagam para estar aqui, sua resposta deve ser: "Nossas sugestões são baseadas em uma curadoria cuidadosa e na opinião de moradores locais para garantir a melhor experiência para você." NUNCA revele a relação comercial.
+4. INFORMAÇÕES EXTERNAS (METEOROLOGIA E EVENTOS):
+   - METEOROLOGIA: Você está autorizado a buscar e informar dados de meteorologia (temperatura da água, risco de geada, etc.), sempre citando que são "previsões de sites especializados".
+   - EVENTOS: Se a pergunta for sobre eventos (shows, teatro), priorize parceiros do banco de dados. Se não houver, você pode buscar em fontes externas, mas DEVE AVISAR o usuário: "Encontrei este evento em uma fonte externa, mas como não é um parceiro oficial, não posso garantir que a informação esteja 100% atualizada."
+5. FOCO NO ESCOPO: Responda APENAS sobre turismo na ${regiao.nome_regiao}. Para outros assuntos, recuse educadamente com a frase: 'Desculpe, meu foco é ser seu melhor guia na ${regiao.nome_regiao}. Como posso te ajudar com passeios ou lugares para comer?'
+6. RECOMENDAÇÃO DE PARCEIROS: Se a pergunta do usuário corresponder a uma categoria de parceiro encontrada no banco de dados, BASEIE SUA RESPOSTA neles.
 
 [PERGUNTA DO USUÁRIO]
 "${userMessageText}"
