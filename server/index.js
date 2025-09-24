@@ -70,21 +70,16 @@ application.post("/api/chat/:slugDaRegiao", async (request, response) => {
 
     const generativeModel = googleGenerativeAIClient.getGenerativeModel({ model: "gemini-1.5-flash" });
 
-    // PROMPT DE EXTRAÇÃO DE TAGS (VERSÃO ROBUSTA E CORRIGIDA)
-    const keywordExtractionPrompt = `Sua única tarefa é extrair até 3 palavras-chave de busca (tags) da frase do usuário abaixo, relacionadas a turismo. Responda APENAS com as palavras separadas por vírgula, sem nenhuma outra frase ou explicação. Se não encontrar nenhuma tag relevante, responda com a palavra "geral".
-Exemplo 1: "onde comer uma pizza boa?" -> "pizza, restaurante, comer"
-Exemplo 2: "qual a história da cidade?" -> "geral"
-Frase: "${userMessageText}"`;
+    const keywordExtractionPrompt = `Sua única tarefa é extrair até 3 palavras-chave de busca (tags) da frase do usuário abaixo, relacionadas a turismo. Responda APENAS com as palavras separadas por vírgula, sem nenhuma outra frase ou explicação. Se não encontrar nenhuma tag relevante, responda com a palavra "geral". Frase: "${userMessageText}"`;
 
     const keywordResult = await generativeModel.generateContent(keywordExtractionPrompt);
     const keywordsText = (await keywordResult.response.text()).trim();
     const firstLineOfKeywords = keywordsText.split('\n')[0];
     const keywords = firstLineOfKeywords.split(',').map(kw => kw.trim().toLowerCase());
 
-    // BUSCA DE PARCEIROS NO SUPABASE
     const { data: parceiros, error } = await supabase
       .from('parceiros')
-      .select('nome, descricao, beneficio_bepit, endereco, faixa_preco, contato_telefone, link_fotos')
+      .select('*') // Selecionamos tudo para salvar nos logs
       .eq('regiao_id', regiao.id)
       .or(`tags.cs.{${keywords.join(',')}}`);
 
@@ -100,7 +95,6 @@ Frase: "${userMessageText}"`;
       ).join('\n\n');
     }
 
-    // PROMPT FINAL E COMPLETO PARA A IA
     const finalPrompt = `
 [CONTEXTO]
 Você é o BEPIT, um assistente de viagem especialista e confiável da ${regiao.nome_regiao}. Sua missão é dar as melhores dicas locais e autênticas, ajudando o usuário a economizar e aproveitar como um morador local.
@@ -122,6 +116,21 @@ ${parceirosContexto}
     const modelResponse = await modelResult.response;
     const modelText = modelResponse.text();
 
+    // <<< INÍCIO DA NOVA LÓGICA DE COLETA DE MÉTRICAS >>>
+    const { error: insertError } = await supabase.from('interacoes').insert({
+      regiao_id: regiao.id,
+      pergunta_usuario: userMessageText,
+      resposta_ia: modelText,
+      parceiros_sugeridos: parceiros || [] // Salva a lista de parceiros que foram encontrados
+    });
+
+    if (insertError) {
+      // Se a gravação do log falhar, não quebramos a experiência do usuário.
+      // Apenas registramos o erro no nosso servidor.
+      console.error("Erro ao salvar interação no Supabase:", insertError);
+    }
+    // <<< FIM DA NOVA LÓGICA DE COLETA DE MÉTRICAS >>>
+
     return response.status(200).json({ reply: modelText });
 
   } catch (error) {
@@ -131,5 +140,5 @@ ${parceirosContexto}
 });
 
 application.listen(serverPort, () => {
-  console.log(`🤖 Cérebro OFICIAL do BEPIT Nexus (v3) rodando na porta ${serverPort}`);
+  console.log(`🤖 Cérebro OFICIAL do BEPIT Nexus (com Métricas) rodando na porta ${serverPort}`);
 });
