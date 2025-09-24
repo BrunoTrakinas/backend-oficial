@@ -6,13 +6,13 @@ import { supabase } from "../lib/supabaseClient.js";
 
 dotenv.config();
 
-// Validações críticas das chaves
+// Validações críticas das chaves de ambiente
 if (!process.env.GEMINI_API_KEY) {
-  console.error("ERRO CRÍTICO: Variável GEMINI_API_KEY não encontrada.");
+  console.error("ERRO CRÍTICO: Variável de ambiente GEMINI_API_KEY não encontrada.");
   process.exit(1);
 }
 if (!process.env.SUPABASE_URL || !process.env.SUPABASE_ANON_KEY) {
-  console.error("ERRO CRÍTICO: Variáveis do Supabase não encontradas.");
+  console.error("ERRO CRÍTICO: Variáveis de ambiente do Supabase não encontradas.");
   process.exit(1);
 }
 
@@ -28,7 +28,6 @@ const allowedOrigins = [
   "http://localhost:5173",
   "https://bepitnexus.netlify.app"
 ];
-
 const crossOriginResourceSharingOptions = {
   origin: function (origin, callback) {
     if (!origin || allowedOrigins.indexOf(origin) !== -1) {
@@ -58,28 +57,26 @@ application.post("/api/chat/:slugDaRegiao", async (request, response) => {
       return response.status(400).json({ error: "Campo 'message' é obrigatório." });
     }
     
-    const { data: regiao, error: regiaoError } = await supabase
-      .from('regioes')
-      .select('id, nome_regiao')
-      .eq('slug', slugDaRegiao)
-      .single();
-
+    const { data: regiao, error: regiaoError } = await supabase.from('regioes').select('id, nome_regiao').eq('slug', slugDaRegiao).single();
     if (regiaoError || !regiao) {
       throw new Error(`Região '${slugDaRegiao}' não encontrada.`);
     }
 
     const generativeModel = googleGenerativeAIClient.getGenerativeModel({ model: "gemini-1.5-flash" });
 
-    const keywordExtractionPrompt = `Sua única tarefa é extrair até 3 palavras-chave de busca (tags) da frase do usuário abaixo, relacionadas a turismo. Responda APENAS com as palavras separadas por vírgula, sem nenhuma outra frase ou explicação. Se não encontrar nenhuma tag relevante, responda com a palavra "geral". Frase: "${userMessageText}"`;
-
+    const keywordExtractionPrompt = `Sua única tarefa é extrair até 3 palavras-chave de busca (tags) da frase do usuário abaixo, relacionadas a turismo. Responda APENAS com as palavras separadas por vírgula, sem nenhuma outra frase ou explicação. Se não encontrar nenhuma tag, responda com a palavra "geral".
+Exemplo 1: "onde comer uma pizza boa?" -> "pizza, restaurante, comer"
+Exemplo 2: "qual a história da cidade?" -> "geral"
+Frase: "${userMessageText}"`;
+    
     const keywordResult = await generativeModel.generateContent(keywordExtractionPrompt);
     const keywordsText = (await keywordResult.response.text()).trim();
     const firstLineOfKeywords = keywordsText.split('\n')[0];
     const keywords = firstLineOfKeywords.split(',').map(kw => kw.trim().toLowerCase());
-
+    
     const { data: parceiros, error } = await supabase
       .from('parceiros')
-      .select('*') // Selecionamos tudo para salvar nos logs
+      .select('nome, descricao, beneficio_bepit, endereco, faixa_preco, contato_telefone, link_fotos')
       .eq('regiao_id', regiao.id)
       .or(`tags.cs.{${keywords.join(',')}}`);
 
@@ -103,10 +100,10 @@ Você é o BEPIT, um assistente de viagem especialista e confiável da ${regiao.
 ${parceirosContexto}
 
 [REGRAS INEGOCIÁVEIS]
-1. Se a lista de parceiros relevantes não estiver vazia, BASEIE SUA RESPOSTA nela. Responda de forma conversada, não como uma lista.
+1. Se a lista de parceiros relevantes não estiver vazia, BASEIE SUA RESPOSTA nela. Responda de forma conversada.
 2. Você é proibido de sugerir que o usuário pesquise em outras fontes. VOCÊ é a fonte.
-3. Se a lista de parceiros relevantes estiver vazia, use seu conhecimento geral para ajudar o usuário de forma honesta.
-4. Responda APENAS sobre turismo na ${regiao.nome_regiao}. Para outros assuntos, recuse educadamente com a frase: 'Desculpe, meu foco é ser seu melhor guia. Como posso te ajudar com passeios ou lugares para comer?'
+3. Se a lista de parceiros relevantes estiver vazia, use seu conhecimento geral para ajudar o usuário.
+4. Responda APENAS sobre turismo na ${regiao.nome_regiao}. Para outros assuntos, recuse educadamente.
 
 [PERGUNTA DO USUÁRIO]
 "${userMessageText}"
@@ -116,27 +113,52 @@ ${parceirosContexto}
     const modelResponse = await modelResult.response;
     const modelText = modelResponse.text();
 
-    // <<< INÍCIO DA NOVA LÓGICA DE COLETA DE MÉTRICAS >>>
-    const { error: insertError } = await supabase.from('interacoes').insert({
+    const { data: newInteraction, error: insertError } = await supabase.from('interacoes').insert({
       regiao_id: regiao.id,
       pergunta_usuario: userMessageText,
       resposta_ia: modelText,
-      parceiros_sugeridos: parceiros || [] // Salva a lista de parceiros que foram encontrados
-    });
+      parceiros_sugeridos: parceiros || []
+    }).select('id').single();
 
     if (insertError) {
-      // Se a gravação do log falhar, não quebramos a experiência do usuário.
-      // Apenas registramos o erro no nosso servidor.
       console.error("Erro ao salvar interação no Supabase:", insertError);
     }
-    // <<< FIM DA NOVA LÓGICA DE COLETA DE MÉTRICAS >>>
 
-    return response.status(200).json({ reply: modelText });
+    return response.status(200).json({ 
+      reply: modelText,
+      interactionId: newInteraction?.id
+    });
 
   } catch (error) {
     console.error("[/api/chat] Erro interno:", error);
     return response.status(500).json({ error: "Erro interno no cérebro do robô." });
   }
+});
+
+// Nova rota para receber o feedback
+application.post("/api/feedback", async (request, response) => {
+    try {
+        const { interactionId, feedback } = request.body;
+
+        if (!interactionId || !feedback) {
+            return response.status(400).json({ error: "ID da interação e feedback são obrigatórios." });
+        }
+
+        const { error } = await supabase
+            .from('interacoes')
+            .update({ feedback_usuario: feedback })
+            .eq('id', interactionId);
+
+        if (error) {
+            throw new Error(error.message);
+        }
+
+        return response.status(200).json({ success: true });
+
+    } catch (error) {
+        console.error("[/api/feedback] Erro interno:", error);
+        return response.status(500).json({ error: "Erro ao registrar feedback." });
+    }
 });
 
 application.listen(serverPort, () => {
