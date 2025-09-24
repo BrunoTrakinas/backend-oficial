@@ -49,6 +49,7 @@ application.get("/health", (request, response) => {
 
 // Rota de chat multi-região
 application.post("/api/chat/:slugDaRegiao", async (request, response) => {
+  let interactionId = null;
   try {
     const { slugDaRegiao } = request.params;
     const { message: userMessageText } = request.body;
@@ -70,12 +71,22 @@ application.post("/api/chat/:slugDaRegiao", async (request, response) => {
     const keywordsText = (await keywordResult.response.text()).trim();
     const firstLineOfKeywords = keywordsText.split('\n')[0];
     const keywords = firstLineOfKeywords.split(',').map(kw => kw.trim().toLowerCase());
+
+    // <<< AQUI ESTÁ A CORREÇÃO CRÍTICA >>>
+    // Criamos uma nova lista de busca que inclui a versão singular de cada palavra-chave
+    const searchKeywords = [...keywords];
+    keywords.forEach(kw => {
+        if (kw.endsWith('s')) {
+            searchKeywords.push(kw.slice(0, -1)); // Adiciona a versão sem o 's'
+        }
+    });
     
     const { data: parceiros, error } = await supabase
       .from('parceiros')
       .select('nome, descricao, beneficio_bepit, endereco, faixa_preco, contato_telefone, link_fotos')
       .eq('regiao_id', regiao.id)
-      .or(`tags.cs.{${keywords.join(',')}}`);
+      // Usamos a nova lista 'searchKeywords' na busca
+      .or(`tags.cs.{${searchKeywords.join(',')}}`);
 
     if (error) {
         console.error("Erro ao buscar parceiros no Supabase:", error);
