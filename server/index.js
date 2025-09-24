@@ -49,7 +49,6 @@ application.get("/health", (request, response) => {
 
 // Rota de chat multi-região
 application.post("/api/chat/:slugDaRegiao", async (request, response) => {
-  let interactionId = null;
   try {
     const { slugDaRegiao } = request.params;
     const { message: userMessageText } = request.body;
@@ -65,7 +64,7 @@ application.post("/api/chat/:slugDaRegiao", async (request, response) => {
 
     const generativeModel = googleGenerativeAIClient.getGenerativeModel({ model: "gemini-1.5-flash" });
 
-    const keywordExtractionPrompt = `Sua única tarefa é extrair até 3 palavras-chave de busca (tags) da frase do usuário abaixo, relacionadas a turismo. Responda APENAS com as palavras separadas por vírgula, sem nenhuma outra frase ou explicação. Se não encontrar nenhuma tag, responda com a palavra "geral". Exemplo: "onde comer uma pizza boa?" -> "pizza, restaurante, comer". Frase: "${userMessageText}"`;
+    const keywordExtractionPrompt = `Sua única tarefa é extrair até 3 palavras-chave de busca (tags) da frase do usuário abaixo, relacionadas a turismo. Responda APENAS com as palavras separadas por vírgula, em minúsculas, sem nenhuma outra frase ou explicação. Se não encontrar nenhuma tag, responda com a palavra "geral". Exemplo: "onde comer uma pizza boa?" -> "pizza, restaurante, comer". Frase: "${userMessageText}"`;
     
     const keywordResult = await generativeModel.generateContent(keywordExtractionPrompt);
     const keywordsText = (await keywordResult.response.text()).trim();
@@ -79,10 +78,9 @@ application.post("/api/chat/:slugDaRegiao", async (request, response) => {
         }
     });
     
-    // CORREÇÃO DA BUSCA: Agora busca nas tags E na categoria, tornando-a mais robusta.
     const { data: parceiros, error } = await supabase
       .from('parceiros')
-      .select('nome, descricao, beneficio_bepit, endereco, faixa_preco, contato_telefone, link_fotos')
+      .select('nome, categoria, descricao, beneficio_bepit, endereco, faixa_preco, contato_telefone, link_fotos')
       .eq('regiao_id', regiao.id)
       .or(`tags.cs.{${searchKeywords.join(',')}},categoria.ilike.%${searchKeywords[0]}%`);
 
@@ -91,28 +89,40 @@ application.post("/api/chat/:slugDaRegiao", async (request, response) => {
         throw new Error("Falha ao consultar o banco de dados.");
     }
 
-    let parceirosContexto = "Nenhum parceiro específico encontrado em nossa base de dados para esta pergunta.";
+    let parceirosContexto = "Nenhum parceiro específico encontrado.";
     if (parceiros && parceiros.length > 0) {
-      parceirosContexto = "Baseado na sua pergunta, encontrei estes parceiros oficiais no nosso banco de dados:\n" + parceiros.map(p => 
-        `- Nome: ${p.nome}\n  - Descrição: ${p.descricao}\n  - Endereço: ${p.endereco}\n  - Faixa de Preço: ${p.faixa_preco}\n  - Contato: ${p.contato_telefone}\n  - Benefício Exclusivo BEPIT: ${p.beneficio_bepit}\n  - Links de Fotos: ${p.link_fotos && p.link_fotos.length > 0 ? 'Sim, existem fotos disponíveis.' : 'Nenhuma foto disponível'}`
+      parceirosContexto = "Parceiros Encontrados:\n" + parceiros.map(p => 
+        `- Nome: ${p.nome}\n  - Descrição: ${p.descricao}\n  - Endereço: ${p.endereco}\n  - Benefício Exclusivo BEPIT: ${p.beneficio_bepit}`
       ).join('\n\n');
     }
 
-    // O PROMPT FINAL E MAIS COMPLETO, COM AS NOVAS REGRAS DE CONCIERGE
+    // PROMPT "CONCIERGE V1.3" DEFINITIVO
     const finalPrompt = `
-[CONTEXTO]
-Você é o BEPIT, um assistente de viagem especialista, confiável e SINCERO da ${regiao.nome_regiao}. Você age como um concierge de hotel 5 estrelas: prestativo, rápido e que antecipa as necessidades do cliente.
+[OBJETIVO PRINCIPAL]
+Você é o BEPIT, o concierge especialista e confiável da ${regiao.nome_regiao}. Sua única missão é fornecer respostas rápidas, úteis e baseadas PRIMARIAMENTE nos parceiros encontrados.
 
-[PARCEIROS RELEVANTES ENCONTRADOS NO BANCO DE DADOS]
+[DADOS DE PARCEIROS ENCONTRADOS PARA ESTA PERGUNTA]
 ${parceirosContexto}
 
-[REGRAS INEGOCIÁVEIS DE COMPORTAMENTO E PERSONALIDADE]
-1. SEJA UM CONCIERGE, NÃO UM MOTOR DE BUSCA: Sua principal função é ajudar o usuário a tomar uma decisão. Se a pergunta for muito ampla (ex: "restaurantes", "passeios"), sua primeira resposta DEVE ser fazer perguntas para refinar a busca. Exemplo: "Claro! Para te dar a melhor sugestão, em qual cidade você está? E que tipo de comida você procura?".
-2. CONCISÃO É REI: Suas respostas devem ser curtas e diretas (2-3 frases no máximo). Respeite o tempo do usuário.
-3. PRIORIDADE TOTAL AOS PARCEIROS: Se a busca refinada do usuário corresponder a um parceiro, sua resposta DEVE ser uma recomendação direta e confiante desse parceiro, usando os dados fornecidos. Ex: "Para pizza em Búzios, a recomendação dos locais é a Pizzaria do Zé. Eles são famosos pela...".
-4. SIGILO ABSOLUTO: NUNCA, em nenhuma hipótese, use as palavras "parceiro", "cadastrado" ou "banco de dados". Sua resposta deve soar como uma dica de um especialista local. Se perguntado sobre a origem das dicas, responda: "Minhas sugestões vêm de uma curadoria cuidadosa com base na experiência de moradores e especialistas da região."
-5. INFORMAÇÕES PÚBLICAS: Você pode e deve fornecer informações factuais como endereços e contatos quando souber, especialmente se forem de parceiros.
-6. FOCO NO ESCOPO: Seu universo é o turismo na ${regiao.nome_regiao}. Se a pergunta for totalmente fora disso, recuse educadamente.
+[HIERARQUIA DE REGRAS (SEMPRE SIGA ESTA ORDEM)]
+REGRA 1 - PRIORIDADE ABSOLUTA AOS PARCEIROS:
+- SE a seção [DADOS DE PARCEIROS ENCONTRADOS] NÃO contiver "Nenhum parceiro específico encontrado", sua resposta DEVE OBRIGATORIAMENTE ser uma recomendação direta e conversada sobre eles.
+- Apresente os parceiros de forma natural. Exemplo: "Para uma ótima pizza na região, eu recomendo a Pizzaria do Zé. Eles oferecem..."
+- NUNCA diga "encontrei estes parceiros no meu banco de dados". Aja como se a recomendação fosse sua.
+- SE a lista de parceiros estiver vazia, e APENAS NESSE CASO, você pode usar seu conhecimento geral, seguindo a REGRA 2.
+
+REGRA 2 - RESPOSTAS SEM PARCEIROS (CONHECIMENTO GERAL):
+- Quando não houver parceiros, seja útil e responda à pergunta do usuário sobre a ${regiao.nome_regiao} com informações factuais e de conhecimento público (praias, shoppings, pontos turísticos).
+- É PERMITIDO e INCENTIVADO que você forneça endereços, descrições e dicas sobre locais públicos.
+
+REGRA 3 - ESTILO E TOM DE VOZ:
+- CONCISÃO É REI: Suas respostas devem ser curtas e diretas. Idealmente, entre 2 e 4 frases. O usuário precisa de informação rápida.
+- NUNCA peça mais informações ao usuário (como "qual seu orçamento?"). Responda com o que você tem.
+- SIGILO COMERCIAL: Se perguntado se os parceiros pagam, responda: "Nossas sugestões são baseadas em uma curadoria cuidadosa e na opinião de moradores locais para garantir a melhor experiência para você."
+
+REGRA 4 - ESCOPO E LIMITAÇÕES:
+- Responda APENAS sobre turismo, serviços e locais na ${regiao.nome_regiao}.
+- Para qualquer outro assunto, recuse com a frase: 'Desculpe, meu foco é ser seu melhor guia na ${regiao.nome_regiao}. Como posso te ajudar por aqui?'
 
 [PERGUNTA DO USUÁRIO]
 "${userMessageText}"
@@ -147,26 +157,21 @@ ${parceirosContexto}
   }
 });
 
-// Nova rota para receber o feedback
+// Rota para receber o feedback
 application.post("/api/feedback", async (request, response) => {
     try {
         const { interactionId, feedback } = request.body;
-
         if (!interactionId || !feedback) {
             return response.status(400).json({ error: "ID da interação e feedback são obrigatórios." });
         }
-
         const { error } = await supabase
             .from('interacoes')
             .update({ feedback_usuario: feedback })
             .eq('id', interactionId);
-
         if (error) {
             throw new Error(error.message);
         }
-
         return response.status(200).json({ success: true });
-
     } catch (error) {
         console.error("[/api/feedback] Erro interno:", error);
         return response.status(500).json({ error: "Erro ao registrar feedback." });
@@ -174,5 +179,5 @@ application.post("/api/feedback", async (request, response) => {
 });
 
 application.listen(serverPort, () => {
-  console.log(`🤖 Cérebro OFICIAL do BEPIT Nexus (com Métricas) rodando na porta ${serverPort}`);
+  console.log(`🤖 Cérebro OFICIAL do BEPIT Nexus (v1.3 - Concierge) rodando na porta ${serverPort}`);
 });
