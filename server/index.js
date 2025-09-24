@@ -7,12 +7,9 @@ import express from "express";
 import cors from "cors";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import dotenv from "dotenv";
-import { supabase } from "./lib/supabaseClient.js";
+import { supabase } from "../lib/supabaseClient.js"; // caminho correto para backend-oficial/lib/supabaseClient.js
 import { randomUUID } from "crypto";
 
-// -----------------------------------------------------------------------------------
-// CONFIGURAÇÃO INICIAL
-// -----------------------------------------------------------------------------------
 dotenv.config();
 
 if (!process.env.GEMINI_API_KEY) {
@@ -22,7 +19,9 @@ if (!process.env.GEMINI_API_KEY) {
 
 const application = express();
 const servidorPorta = process.env.PORT || 3002;
-const googleGenerativeArtificialIntelligenceClient = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const googleGenerativeArtificialIntelligenceClient = new GoogleGenerativeAI(
+  process.env.GEMINI_API_KEY
+);
 
 const origensPermitidas = [
   "http://localhost:5173",
@@ -46,11 +45,10 @@ application.use(cors(opcoesDeCompartilhamentoEntreOrigens));
 application.options("*", cors(opcoesDeCompartilhamentoEntreOrigens));
 application.use(express.json());
 
-// -----------------------------------------------------------------------------------
-// SAÚDE DO SERVIDOR
-// -----------------------------------------------------------------------------------
 application.get("/health", (request, response) => {
-  response.status(200).json({ ok: true, message: "Servidor BEPIT está online." });
+  response
+    .status(200)
+    .json({ ok: true, message: "Servidor BEPIT está online." });
 });
 
 // -----------------------------------------------------------------------------------
@@ -60,11 +58,49 @@ function detectarIntencaoDeFollowUp(textoDoUsuario) {
   const t = String(textoDoUsuario || "").toLowerCase();
 
   const mapa = [
-    { intencao: "horario", padroes: ["horário", "horario", "hora", "abre", "fecha", "funciona", "funcionamento", "que horas"] },
-    { intencao: "endereco", padroes: ["onde fica", "endereço", "endereco", "localização", "localizacao", "como chegar", "fica onde"] },
-    { intencao: "contato", padroes: ["contato", "telefone", "whatsapp", "whats", "ligar"] },
+    {
+      intencao: "horario",
+      padroes: [
+        "horário",
+        "horario",
+        "hora",
+        "abre",
+        "fecha",
+        "funciona",
+        "funcionamento",
+        "que horas"
+      ]
+    },
+    {
+      intencao: "endereco",
+      padroes: [
+        "onde fica",
+        "endereço",
+        "endereco",
+        "localização",
+        "localizacao",
+        "como chegar",
+        "fica onde"
+      ]
+    },
+    {
+      intencao: "contato",
+      padroes: ["contato", "telefone", "whatsapp", "whats", "ligar"]
+    },
     { intencao: "fotos", padroes: ["foto", "fotos", "imagem", "imagens", "galeria"] },
-    { intencao: "preco", padroes: ["preço", "preco", "faixa de preço", "faixa de preco", "caro", "barato", "valor", "quanto custa"] }
+    {
+      intencao: "preco",
+      padroes: [
+        "preço",
+        "preco",
+        "faixa de preço",
+        "faixa de preco",
+        "caro",
+        "barato",
+        "valor",
+        "quanto custa"
+      ]
+    }
   ];
 
   for (const item of mapa) {
@@ -85,8 +121,15 @@ application.post("/api/chat/:slugDaRegiao", async (request, response) => {
     const { slugDaRegiao } = request.params;
     let { message: textoDoUsuario, conversationId } = request.body;
 
-    if (!textoDoUsuario || typeof textoDoUsuario !== "string" || textoDoUsuario.trim().length === 0) {
-      return response.status(400).json({ error: "O campo 'message' é obrigatório e deve ser uma string não vazia." });
+    if (
+      !textoDoUsuario ||
+      typeof textoDoUsuario !== "string" ||
+      textoDoUsuario.trim().length === 0
+    ) {
+      return response.status(400).json({
+        error:
+          "O campo 'message' é obrigatório e deve ser uma string não vazia."
+      });
     }
 
     // obtém a região pelo slug
@@ -97,11 +140,17 @@ application.post("/api/chat/:slugDaRegiao", async (request, response) => {
       .single();
 
     if (erroRegiao || !regiao) {
-      return response.status(404).json({ error: `Região com apelido (slug) '${slugDaRegiao}' não encontrada.` });
+      return response.status(404).json({
+        error: `Região com apelido (slug) '${slugDaRegiao}' não encontrada.`
+      });
     }
 
     // garante um conversationId e carrega ou cria a conversa
-    if (!conversationId || typeof conversationId !== "string" || conversationId.trim().length === 0) {
+    if (
+      !conversationId ||
+      typeof conversationId !== "string" ||
+      conversationId.trim().length === 0
+    ) {
       conversationId = randomUUID();
 
       const { error: erroCriacaoConversa } = await supabase
@@ -117,7 +166,9 @@ application.post("/api/chat/:slugDaRegiao", async (request, response) => {
 
       if (erroCriacaoConversa) {
         console.error("Erro ao criar conversa:", erroCriacaoConversa);
-        return response.status(500).json({ error: "Erro ao iniciar conversa." });
+        return response
+          .status(500)
+          .json({ error: "Erro ao iniciar conversa." });
       }
     }
 
@@ -128,7 +179,9 @@ application.post("/api/chat/:slugDaRegiao", async (request, response) => {
       .single();
 
     if (erroCarregarConversa || !conversaAtual) {
-      return response.status(404).json({ error: "Conversa não encontrada." });
+      return response
+        .status(404)
+        .json({ error: "Conversa não encontrada." });
     }
 
     // detecção de follow-up curto antes de chamar a IA
@@ -138,7 +191,9 @@ application.post("/api/chat/:slugDaRegiao", async (request, response) => {
       const p = conversaAtual.parceiro_em_foco;
 
       if (intencaoFollowUp === "horario") {
-        const horario = p.horario_funcionamento ? String(p.horario_funcionamento) : "O parceiro não informou horário de funcionamento. Recomendo ligar antes de ir.";
+        const horario = p.horario_funcionamento
+          ? String(p.horario_funcionamento)
+          : "O parceiro não informou horário de funcionamento. Recomendo ligar antes de ir.";
         const respostaDireta = `Horário de funcionamento de ${p.nome}: ${horario}`;
 
         await supabase.from("interacoes").insert({
@@ -178,7 +233,9 @@ application.post("/api/chat/:slugDaRegiao", async (request, response) => {
       }
 
       if (intencaoFollowUp === "contato") {
-        const contato = p.contato_telefone ? String(p.contato_telefone) : "Contato não informado.";
+        const contato = p.contato_telefone
+          ? String(p.contato_telefone)
+          : "Contato não informado.";
         const respostaDireta = `Contato de ${p.nome}: ${contato}`;
 
         await supabase.from("interacoes").insert({
@@ -198,7 +255,8 @@ application.post("/api/chat/:slugDaRegiao", async (request, response) => {
       }
 
       if (intencaoFollowUp === "fotos") {
-        const temFotos = Array.isArray(p.link_fotos) && p.link_fotos.length > 0;
+        const temFotos =
+          Array.isArray(p.link_fotos) && p.link_fotos.length > 0;
         const respostaDireta = temFotos
           ? `Aqui estão algumas fotos de ${p.nome}.`
           : `Não encontrei fotos de ${p.nome}.`;
@@ -220,7 +278,9 @@ application.post("/api/chat/:slugDaRegiao", async (request, response) => {
       }
 
       if (intencaoFollowUp === "preco") {
-        const preco = p.faixa_preco ? String(p.faixa_preco) : "Faixa de preço não informada.";
+        const preco = p.faixa_preco
+          ? String(p.faixa_preco)
+          : "Faixa de preço não informada.";
         const respostaDireta = `Faixa de preço de ${p.nome}: ${preco}`;
 
         await supabase.from("interacoes").insert({
@@ -241,8 +301,16 @@ application.post("/api/chat/:slugDaRegiao", async (request, response) => {
     }
 
     // se intenção foi follow-up, mas não temos parceiro em foco e há vários sugeridos, peça desambiguação
-    if (!conversaAtual.parceiro_em_foco && intencaoFollowUp !== "nenhuma" && Array.isArray(conversaAtual.parceiros_sugeridos) && conversaAtual.parceiros_sugeridos.length > 1) {
-      const nomes = conversaAtual.parceiros_sugeridos.map((x) => x.nome).slice(0, 5).join(", ");
+    if (
+      !conversaAtual.parceiro_em_foco &&
+      intencaoFollowUp !== "nenhuma" &&
+      Array.isArray(conversaAtual.parceiros_sugeridos) &&
+      conversaAtual.parceiros_sugeridos.length > 1
+    ) {
+      const nomes = conversaAtual.parceiros_sugeridos
+        .map((x) => x.nome)
+        .slice(0, 5)
+        .join(", ");
       const respostaDireta = `Você está se referindo a qual parceiro: ${nomes}?`;
 
       await supabase.from("interacoes").insert({
@@ -262,7 +330,10 @@ application.post("/api/chat/:slugDaRegiao", async (request, response) => {
     }
 
     // chama o modelo da ia
-    const modeloGenerativo = googleGenerativeArtificialIntelligenceClient.getGenerativeModel({ model: "gemini-1.5-flash" });
+    const modeloGenerativo =
+      googleGenerativeArtificialIntelligenceClient.getGenerativeModel({
+        model: "gemini-1.5-flash"
+      });
 
     // extrai palavras-chave de forma robusta
     const promptParaExtrairPalavrasChave = `
@@ -277,22 +348,29 @@ exemplo: "onde comer uma pizza boa?" -> "pizza, restaurante, comer"
 frase: "${textoDoUsuario}"
 `.trim();
 
-    const resultadoDePalavrasChave = await modeloGenerativo.generateContent(promptParaExtrairPalavrasChave);
+    const resultadoDePalavrasChave =
+      await modeloGenerativo.generateContent(promptParaExtrairPalavrasChave);
     const textoDePalavrasChave = (await resultadoDePalavrasChave.response.text()).trim();
 
-    const primeiraLinha = (textoDePalavrasChave.split("\n")[0] || "").replace(/["'“”‘’]/g, "");
+    const primeiraLinha = (textoDePalavrasChave.split("\n")[0] || "").replace(
+      /["'“”‘’]/g,
+      ""
+    );
     const palavrasChaveBasicas = primeiraLinha
       .split(",")
       .map((p) => (p || "").toLowerCase().trim())
       .filter((p) => p.length > 0);
 
-    const palavrasChaveBase = palavrasChaveBasicas.length > 0 ? palavrasChaveBasicas.slice(0, 5) : ["geral"];
+    const palavrasChaveBase =
+      palavrasChaveBasicas.length > 0 ? palavrasChaveBasicas.slice(0, 5) : ["geral"];
 
     // gera variações simples singular/plural, deduplica e limpa
     const palavrasChaveExpandidas = Array.from(
       new Set([
         ...palavrasChaveBase,
-        ...palavrasChaveBase.map((p) => (p.endsWith("s") ? p.slice(0, -1) : `${p}s`))
+        ...palavrasChaveBase.map((p) =>
+          p.endsWith("s") ? p.slice(0, -1) : `${p}s`
+        )
       ])
     )
       .map((p) => p.trim())
@@ -303,7 +381,9 @@ frase: "${textoDoUsuario}"
     // consulta parceiros usando overlaps em tags e ilike em categoria
     let consultaParceiros = supabase
       .from("parceiros")
-      .select("id, nome, categoria, descricao, beneficio_bepit, endereco, faixa_preco, contato_telefone, horario_funcionamento, link_fotos, tags")
+      .select(
+        "id, nome, categoria, descricao, beneficio_bepit, endereco, faixa_preco, contato_telefone, horario_funcionamento, link_fotos, tags"
+      )
       .eq("regiao_id", regiao.id);
 
     let parceiros = [];
@@ -389,9 +469,14 @@ ${contextoDeParceiros}
     const textoDaIa = resultadoDaIa.response.text();
 
     // fotos para o cliente
-    const fotosParaCliente = parceiroEmFoco && Array.isArray(parceiroEmFoco.link_fotos)
-      ? parceiroEmFoco.link_fotos
-      : (Array.isArray(parceiros) ? parceiros.flatMap((p) => Array.isArray(p.link_fotos) ? p.link_fotos : []) : []);
+    const fotosParaCliente =
+      parceiroEmFoco && Array.isArray(parceiroEmFoco.link_fotos)
+        ? parceiroEmFoco.link_fotos
+        : Array.isArray(parceiros)
+        ? parceiros.flatMap((p) =>
+            Array.isArray(p.link_fotos) ? p.link_fotos : []
+          )
+        : [];
 
     // salva interação
     const { data: novaInteracao, error: erroSalvarInteracao } = await supabase
@@ -417,10 +502,11 @@ ${contextoDeParceiros}
       photoLinks: fotosParaCliente,
       conversationId: conversationId
     });
-
   } catch (error) {
     console.error("[/api/chat] Erro interno:", error);
-    return response.status(500).json({ error: "Ocorreu um erro interno no servidor do BEPIT." });
+    return response
+      .status(500)
+      .json({ error: "Ocorreu um erro interno no servidor do BEPIT." });
   }
 });
 
@@ -432,10 +518,16 @@ application.post("/api/feedback", async (request, response) => {
     const { interactionId, feedback } = request.body;
 
     if (!interactionId || typeof interactionId !== "string") {
-      return response.status(400).json({ error: "O campo 'interactionId' é obrigatório e deve ser uma string (uuid)." });
+      return response.status(400).json({
+        error:
+          "O campo 'interactionId' é obrigatório e deve ser uma string (uuid)."
+      });
     }
     if (!feedback || typeof feedback !== "string" || feedback.trim().length === 0) {
-      return response.status(400).json({ error: "O campo 'feedback' é obrigatório e deve ser uma string não vazia." });
+      return response.status(400).json({
+        error:
+          "O campo 'feedback' é obrigatório e deve ser uma string não vazia."
+      });
     }
 
     const { error } = await supabase
@@ -445,10 +537,14 @@ application.post("/api/feedback", async (request, response) => {
 
     if (error) {
       console.error("Erro ao registrar feedback:", error);
-      return response.status(500).json({ error: "Erro ao registrar feedback." });
+      return response
+        .status(500)
+        .json({ error: "Erro ao registrar feedback." });
     }
 
-    return response.status(200).json({ success: true, message: "Feedback registrado com sucesso." });
+    return response
+      .status(200)
+      .json({ success: true, message: "Feedback registrado com sucesso." });
   } catch (error) {
     console.error("[/api/feedback] Erro ao registrar feedback:", error);
     return response.status(500).json({ error: "Erro ao registrar feedback." });
@@ -459,5 +555,7 @@ application.post("/api/feedback", async (request, response) => {
 // SUBIR O SERVIDOR
 // -----------------------------------------------------------------------------------
 application.listen(servidorPorta, () => {
-  console.log(`✅ 🤖 Servidor do BEPIT Nexus (v2.0) rodando em http://localhost:${servidorPorta}`);
+  console.log(
+    `✅ 🤖 Servidor do BEPIT Nexus (v2.0) rodando em http://localhost:${servidorPorta}`
+  );
 });
