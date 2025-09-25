@@ -15,6 +15,22 @@ if (!process.env.GEMINI_API_KEY) {
 
 const app = express();
 const PORT = process.env.PORT || 3002;
+// Ajuste com SEU domínio do Netlify
+const ORIGENS_PERMITIDAS = [
+  "http://localhost:5173",          // dev local
+  "https://bepitnexus.netlify.app"  // produção (seu front)
+];
+
+app.use(cors({
+  origin: (origin, cb) => {
+    if (!origin) return cb(null, true); // permite curl, Postman etc
+    if (ORIGENS_PERMITIDAS.includes(origin)) return cb(null, true);
+    return cb(new Error("CORS bloqueado para essa origem."));
+  },
+  credentials: true
+}));
+
+app.options("*", cors());
 app.use(cors({ origin: true, credentials: true }));
 app.use(express.json());
 
