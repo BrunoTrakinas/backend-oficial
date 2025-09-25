@@ -1,561 +1,283 @@
-// ===================================================================================
-// ARQUIVO PRINCIPAL DO SERVIDOR (O "CÉREBRO" DO BEPIT)
-// VERSÃO 2.0 - CONVERSA COM CONTEXTO PERSISTENTE (TABELA CONVERSAS) + FOLLOW-UPS DIRETOS
-// ===================================================================================
-
+// server.js
 import express from "express";
 import cors from "cors";
-import { GoogleGenerativeAI } from "@google/generative-ai";
 import dotenv from "dotenv";
-import { supabase } from "../lib/supabaseClient.js"; // caminho correto para backend-oficial/lib/supabaseClient.js
 import { randomUUID } from "crypto";
+import { GoogleGenerativeAI } from "@google/generative-ai";
+import { supabase } from "../lib/supabaseClient.js";
 
 dotenv.config();
 
 if (!process.env.GEMINI_API_KEY) {
-  console.error("Variável GEMINI_API_KEY não encontrada no arquivo .env.");
+  console.error("Faltou GEMINI_API_KEY no .env");
   process.exit(1);
 }
 
-const application = express();
-const servidorPorta = process.env.PORT || 3002;
-const googleGenerativeArtificialIntelligenceClient = new GoogleGenerativeAI(
-  process.env.GEMINI_API_KEY
-);
+const app = express();
+const PORT = process.env.PORT || 3002;
+app.use(cors({ origin: true, credentials: true }));
+app.use(express.json());
 
-const origensPermitidas = [
-  "http://localhost:5173",
-  "https://bepitnexus.netlify.app"
-];
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-const opcoesDeCompartilhamentoEntreOrigens = {
-  origin: function (origin, callback) {
-    if (!origin || origensPermitidas.indexOf(origin) !== -1) {
-      callback(null, true);
-    } else {
-      callback(new Error("Acesso negado pelo CORS."));
-    }
-  },
-  credentials: true,
-  methods: "GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS",
-  allowedHeaders: ["Content-Type", "Authorization"]
-};
-
-application.use(cors(opcoesDeCompartilhamentoEntreOrigens));
-application.options("*", cors(opcoesDeCompartilhamentoEntreOrigens));
-application.use(express.json());
-
-application.get("/health", (request, response) => {
-  response
-    .status(200)
-    .json({ ok: true, message: "Servidor BEPIT está online." });
+app.get("/health", (req, res) => {
+  res.json({ ok: true, message: "BEPIT Nexus online", port: String(PORT) });
 });
 
-// -----------------------------------------------------------------------------------
-// DETECÇÃO DE INTENÇÃO DE PERGUNTA CURTA (FOLLOW-UP)
-// -----------------------------------------------------------------------------------
-function detectarIntencaoDeFollowUp(textoDoUsuario) {
-  const t = String(textoDoUsuario || "").toLowerCase();
+// Utilitário
+const slugify = (s) =>
+  String(s || "")
+    .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase().replace(/[^a-z0-9]+/g, "-")
+    .replace(/(^-|-$)+/g, "");
 
-  const mapa = [
-    {
-      intencao: "horario",
-      padroes: [
-        "horário",
-        "horario",
-        "hora",
-        "abre",
-        "fecha",
-        "funciona",
-        "funcionamento",
-        "que horas"
-      ]
-    },
-    {
-      intencao: "endereco",
-      padroes: [
-        "onde fica",
-        "endereço",
-        "endereco",
-        "localização",
-        "localizacao",
-        "como chegar",
-        "fica onde"
-      ]
-    },
-    {
-      intencao: "contato",
-      padroes: ["contato", "telefone", "whatsapp", "whats", "ligar"]
-    },
-    { intencao: "fotos", padroes: ["foto", "fotos", "imagem", "imagens", "galeria"] },
-    {
-      intencao: "preco",
-      padroes: [
-        "preço",
-        "preco",
-        "faixa de preço",
-        "faixa de preco",
-        "caro",
-        "barato",
-        "valor",
-        "quanto custa"
-      ]
-    }
-  ];
-
-  for (const item of mapa) {
-    for (const p of item.padroes) {
-      if (t.includes(p)) return item.intencao;
-    }
-  }
-  return "nenhuma";
-}
-
-// -----------------------------------------------------------------------------------
-// ROTA PRINCIPAL DO CHAT
-// -----------------------------------------------------------------------------------
-application.post("/api/chat/:slugDaRegiao", async (request, response) => {
-  console.log("\n--- NOVA INTERAÇÃO INICIADA ---");
-
+// Chat por REGIÃO (macro)
+app.post("/api/chat/:regiaoSlug", async (req, res) => {
   try {
-    const { slugDaRegiao } = request.params;
-    let { message: textoDoUsuario, conversationId } = request.body;
-
-    if (
-      !textoDoUsuario ||
-      typeof textoDoUsuario !== "string" ||
-      textoDoUsuario.trim().length === 0
-    ) {
-      return response.status(400).json({
-        error:
-          "O campo 'message' é obrigatório e deve ser uma string não vazia."
-      });
+    const { regiaoSlug } = req.params;
+    let { message, conversationId } = req.body;
+    if (!message || typeof message !== "string" || !message.trim()) {
+      return res.status(400).json({ error: "message obrigatório" });
     }
 
-    // obtém a região pelo slug
-    const { data: regiao, error: erroRegiao } = await supabase
-      .from("regioes")
-      .select("id, nome_regiao")
-      .eq("slug", slugDaRegiao)
-      .single();
+    // 1) Carregar REGIÃO e CIDADES
+    const { data: regiao, error: errReg } = await supabase
+      .from("regioes").select("id, nome, slug").eq("slug", regiaoSlug).single();
+    if (errReg || !regiao) return res.status(404).json({ error: `Região '${regiaoSlug}' não encontrada` });
 
-    if (erroRegiao || !regiao) {
-      return response.status(404).json({
-        error: `Região com apelido (slug) '${slugDaRegiao}' não encontrada.`
-      });
+    const { data: cidades, error: errCid } = await supabase
+      .from("cidades").select("id, nome, slug").eq("regiao_id", regiao.id);
+    if (errCid) return res.status(500).json({ error: "Erro ao carregar cidades" });
+
+    // 2) Detectar cidade pela frase
+    const lower = message.toLowerCase();
+    let cidadeDetectada = null;
+    for (const c of (cidades || [])) {
+      const nome = String(c.nome).toLowerCase();
+      const slug = String(c.slug).toLowerCase();
+      if (lower.includes(nome) || lower.includes(slug)) { cidadeDetectada = c; break; }
     }
 
-    // garante um conversationId e carrega ou cria a conversa
-    if (
-      !conversationId ||
-      typeof conversationId !== "string" ||
-      conversationId.trim().length === 0
-    ) {
+    // 3) Criar conversa se faltar
+    if (!conversationId || typeof conversationId !== "string" || !conversationId.trim()) {
       conversationId = randomUUID();
-
-      const { error: erroCriacaoConversa } = await supabase
-        .from("conversas")
-        .insert({
-          id: conversationId,
-          regiao_id: regiao.id,
-          parceiro_em_foco: null,
-          parceiros_sugeridos: [],
-          ultima_pergunta_usuario: null,
-          ultima_resposta_ia: null
-        });
-
-      if (erroCriacaoConversa) {
-        console.error("Erro ao criar conversa:", erroCriacaoConversa);
-        return response
-          .status(500)
-          .json({ error: "Erro ao iniciar conversa." });
-      }
-    }
-
-    const { data: conversaAtual, error: erroCarregarConversa } = await supabase
-      .from("conversas")
-      .select("id, regiao_id, parceiro_em_foco, parceiros_sugeridos")
-      .eq("id", conversationId)
-      .single();
-
-    if (erroCarregarConversa || !conversaAtual) {
-      return response
-        .status(404)
-        .json({ error: "Conversa não encontrada." });
-    }
-
-    // detecção de follow-up curto antes de chamar a IA
-    const intencaoFollowUp = detectarIntencaoDeFollowUp(textoDoUsuario);
-
-    if (conversaAtual.parceiro_em_foco && intencaoFollowUp !== "nenhuma") {
-      const p = conversaAtual.parceiro_em_foco;
-
-      if (intencaoFollowUp === "horario") {
-        const horario = p.horario_funcionamento
-          ? String(p.horario_funcionamento)
-          : "O parceiro não informou horário de funcionamento. Recomendo ligar antes de ir.";
-        const respostaDireta = `Horário de funcionamento de ${p.nome}: ${horario}`;
-
-        await supabase.from("interacoes").insert({
-          regiao_id: regiao.id,
-          conversation_id: conversationId,
-          pergunta_usuario: textoDoUsuario,
-          resposta_ia: respostaDireta,
-          parceiros_sugeridos: conversaAtual.parceiros_sugeridos || []
-        });
-
-        return response.status(200).json({
-          reply: respostaDireta,
-          interactionId: null,
-          photoLinks: Array.isArray(p.link_fotos) ? p.link_fotos : [],
-          conversationId: conversationId
-        });
-      }
-
-      if (intencaoFollowUp === "endereco") {
-        const endereco = p.endereco ? String(p.endereco) : "Endereço não informado.";
-        const respostaDireta = `Endereço de ${p.nome}: ${endereco}`;
-
-        await supabase.from("interacoes").insert({
-          regiao_id: regiao.id,
-          conversation_id: conversationId,
-          pergunta_usuario: textoDoUsuario,
-          resposta_ia: respostaDireta,
-          parceiros_sugeridos: conversaAtual.parceiros_sugeridos || []
-        });
-
-        return response.status(200).json({
-          reply: respostaDireta,
-          interactionId: null,
-          photoLinks: Array.isArray(p.link_fotos) ? p.link_fotos : [],
-          conversationId: conversationId
-        });
-      }
-
-      if (intencaoFollowUp === "contato") {
-        const contato = p.contato_telefone
-          ? String(p.contato_telefone)
-          : "Contato não informado.";
-        const respostaDireta = `Contato de ${p.nome}: ${contato}`;
-
-        await supabase.from("interacoes").insert({
-          regiao_id: regiao.id,
-          conversation_id: conversationId,
-          pergunta_usuario: textoDoUsuario,
-          resposta_ia: respostaDireta,
-          parceiros_sugeridos: conversaAtual.parceiros_sugeridos || []
-        });
-
-        return response.status(200).json({
-          reply: respostaDireta,
-          interactionId: null,
-          photoLinks: Array.isArray(p.link_fotos) ? p.link_fotos : [],
-          conversationId: conversationId
-        });
-      }
-
-      if (intencaoFollowUp === "fotos") {
-        const temFotos =
-          Array.isArray(p.link_fotos) && p.link_fotos.length > 0;
-        const respostaDireta = temFotos
-          ? `Aqui estão algumas fotos de ${p.nome}.`
-          : `Não encontrei fotos de ${p.nome}.`;
-
-        await supabase.from("interacoes").insert({
-          regiao_id: regiao.id,
-          conversation_id: conversationId,
-          pergunta_usuario: textoDoUsuario,
-          resposta_ia: respostaDireta,
-          parceiros_sugeridos: conversaAtual.parceiros_sugeridos || []
-        });
-
-        return response.status(200).json({
-          reply: respostaDireta,
-          interactionId: null,
-          photoLinks: temFotos ? p.link_fotos : [],
-          conversationId: conversationId
-        });
-      }
-
-      if (intencaoFollowUp === "preco") {
-        const preco = p.faixa_preco
-          ? String(p.faixa_preco)
-          : "Faixa de preço não informada.";
-        const respostaDireta = `Faixa de preço de ${p.nome}: ${preco}`;
-
-        await supabase.from("interacoes").insert({
-          regiao_id: regiao.id,
-          conversation_id: conversationId,
-          pergunta_usuario: textoDoUsuario,
-          resposta_ia: respostaDireta,
-          parceiros_sugeridos: conversaAtual.parceiros_sugeridos || []
-        });
-
-        return response.status(200).json({
-          reply: respostaDireta,
-          interactionId: null,
-          photoLinks: Array.isArray(p.link_fotos) ? p.link_fotos : [],
-          conversationId: conversationId
-        });
-      }
-    }
-
-    // se intenção foi follow-up, mas não temos parceiro em foco e há vários sugeridos, peça desambiguação
-    if (
-      !conversaAtual.parceiro_em_foco &&
-      intencaoFollowUp !== "nenhuma" &&
-      Array.isArray(conversaAtual.parceiros_sugeridos) &&
-      conversaAtual.parceiros_sugeridos.length > 1
-    ) {
-      const nomes = conversaAtual.parceiros_sugeridos
-        .map((x) => x.nome)
-        .slice(0, 5)
-        .join(", ");
-      const respostaDireta = `Você está se referindo a qual parceiro: ${nomes}?`;
-
-      await supabase.from("interacoes").insert({
+      await supabase.from("conversas").insert({
+        id: conversationId,
         regiao_id: regiao.id,
-        conversation_id: conversationId,
-        pergunta_usuario: textoDoUsuario,
-        resposta_ia: respostaDireta,
-        parceiros_sugeridos: conversaAtual.parceiros_sugeridos || []
-      });
-
-      return response.status(200).json({
-        reply: respostaDireta,
-        interactionId: null,
-        photoLinks: [],
-        conversationId: conversationId
+        parceiro_em_foco: null,
+        parceiros_sugeridos: [],
+        ultima_pergunta_usuario: null,
+        ultima_resposta_ia: null
       });
     }
 
-    // chama o modelo da ia
-    const modeloGenerativo =
-      googleGenerativeArtificialIntelligenceClient.getGenerativeModel({
-        model: "gemini-1.5-flash"
-      });
+    // 4) Registrar busca de texto (para métricas)
+    await supabase.from("buscas_texto").insert({
+      regiao_id: regiao.id,
+      cidade_id: cidadeDetectada?.id || null,
+      texto: message
+    });
+    await supabase.from("eventos_analytics").insert({
+      regiao_id: regiao.id,
+      cidade_id: cidadeDetectada?.id || null,
+      conversation_id: conversationId,
+      tipo_evento: "search",
+      payload: { q: message }
+    });
 
-    // extrai palavras-chave de forma robusta
-    const promptParaExtrairPalavrasChave = `
-sua tarefa é extrair até 3 palavras-chave de turismo da frase abaixo.
+    // 5) Palavras-chave (Gemini)
+    const modelo = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+    const promptKW = `
+extraia até 3 palavras-chave de turismo da frase abaixo.
 regras:
 - responda apenas com as palavras separadas por vírgula.
-- tudo em minúsculas.
-- sem explicações.
-- se não encontrar nenhuma tag, responda "geral".
-exemplo: "onde comer uma pizza boa?" -> "pizza, restaurante, comer"
-
-frase: "${textoDoUsuario}"
+- minúsculas, sem explicações.
+- se não achar, responda "geral".
+frase: "${message}"
 `.trim();
+    const respKW = await modelo.generateContent(promptKW);
+    const kwRaw = (await respKW.response.text()).trim();
+    const kwLine = (kwRaw.split("\n")[0] || "").replace(/["'“”‘’]/g, "");
+    const base = kwLine.split(",").map((x)=>x.trim().toLowerCase()).filter(Boolean);
+    const termos = Array.from(new Set([
+      ...base,
+      ...base.map(p => (p.endsWith("s") ? p.slice(0,-1) : `${p}s`))
+    ])).filter(p => p.length >= 3);
 
-    const resultadoDePalavrasChave =
-      await modeloGenerativo.generateContent(promptParaExtrairPalavrasChave);
-    const textoDePalavrasChave = (await resultadoDePalavrasChave.response.text()).trim();
+    // 6) Buscar parceiros/dicas na(s) cidade(s)
+    const cidadeIds = cidadeDetectada ? [cidadeDetectada.id] : (cidades||[]).map(c=>c.id);
+    let q = supabase.from("parceiros").select(
+      "id, tipo, nome, categoria, descricao, beneficio_bepit, endereco, contato, tags, horario_funcionamento, faixa_preco, fotos, cidade_id"
+    ).eq("ativo", true).in("cidade_id", cidadeIds);
 
-    const primeiraLinha = (textoDePalavrasChave.split("\n")[0] || "").replace(
-      /["'“”‘’]/g,
-      ""
-    );
-    const palavrasChaveBasicas = primeiraLinha
-      .split(",")
-      .map((p) => (p || "").toLowerCase().trim())
-      .filter((p) => p.length > 0);
-
-    const palavrasChaveBase =
-      palavrasChaveBasicas.length > 0 ? palavrasChaveBasicas.slice(0, 5) : ["geral"];
-
-    // gera variações simples singular/plural, deduplica e limpa
-    const palavrasChaveExpandidas = Array.from(
-      new Set([
-        ...palavrasChaveBase,
-        ...palavrasChaveBase.map((p) =>
-          p.endsWith("s") ? p.slice(0, -1) : `${p}s`
-        )
-      ])
-    )
-      .map((p) => p.trim())
-      .filter((p) => p.length >= 3);
-
-    console.log("[LOG] Palavras-chave finais:", palavrasChaveExpandidas);
-
-    // consulta parceiros usando overlaps em tags e ilike em categoria
-    let consultaParceiros = supabase
-      .from("parceiros")
-      .select(
-        "id, nome, categoria, descricao, beneficio_bepit, endereco, faixa_preco, contato_telefone, horario_funcionamento, link_fotos, tags"
-      )
-      .eq("regiao_id", regiao.id);
-
-    let parceiros = [];
-    let erroParceiros = null;
-
-    if (palavrasChaveExpandidas.length > 0) {
-      const arrayComAspas = palavrasChaveExpandidas.map((k) => `"${k}"`).join(",");
-      const partesOr = [`tags.ov.{${arrayComAspas}}`];
-      for (const k of palavrasChaveExpandidas) {
-        partesOr.push(`categoria.ilike.%${k}%`);
+    if (termos.length > 0) {
+      const orParts = [];
+      for (const t of termos) {
+        orParts.push(`tags.cs.${JSON.stringify([t])}`);
+        orParts.push(`categoria.ilike.%${t}%`);
+        orParts.push(`nome.ilike.%${t}%`);
       }
-      const filtroOr = partesOr.join(",");
-
-      const resultado = await consultaParceiros.or(filtroOr);
-      parceiros = resultado.data || [];
-      erroParceiros = resultado.error || null;
-      console.log("[LOG] Filtro OR usado:", filtroOr);
-    } else {
-      const resultado = await consultaParceiros;
-      parceiros = resultado.data || [];
-      erroParceiros = resultado.error || null;
+      q = q.or(orParts.join(","));
     }
 
-    if (erroParceiros) {
-      console.error("Erro ao buscar parceiros:", erroParceiros);
-      return response.status(500).json({ error: "Falha ao consultar parceiros." });
-    }
+    const { data: itens, error: errParc } = await q;
+    if (errParc) return res.status(500).json({ error: "Falha ao consultar parceiros/dicas" });
 
-    // define parceiro em foco e parceiros sugeridos
-    let parceiroEmFoco = null;
-    if (Array.isArray(parceiros) && parceiros.length > 0) {
-      parceiroEmFoco = parceiros[0];
-    }
+    // 7) Escolher foco e montar contexto
+    const parceiroEmFoco = Array.isArray(itens) && itens.length > 0 ? itens[0] : null;
+    await supabase.from("conversas").update({
+      parceiro_em_foco: parceiroEmFoco,
+      parceiros_sugeridos: itens
+    }).eq("id", conversationId);
 
-    const { error: erroAtualizarConversa } = await supabase
-      .from("conversas")
-      .update({
-        parceiro_em_foco: parceiroEmFoco,
-        parceiros_sugeridos: Array.isArray(parceiros) ? parceiros : []
-      })
-      .eq("id", conversationId);
+    const contexto = (itens && itens.length)
+      ? itens.map(p => {
+          const tag = p.tipo === "DICA" ? "[DICA]" : "[PARCEIRO]";
+          return `${tag} ${p.nome} — ${p.categoria||"—"} — ${p.endereco||"—"}`;
+        }).slice(0, 10).join("\n")
+      : "Nenhum item encontrado.";
 
-    if (erroAtualizarConversa) {
-      console.error("Erro ao atualizar conversa:", erroAtualizarConversa);
-    }
-
-    // monta contexto para a ia
-    let contextoDeParceiros = "Nenhum parceiro específico encontrado.";
-    if (Array.isArray(parceiros) && parceiros.length > 0) {
-      contextoDeParceiros =
-        "Parceiros Encontrados:\n" +
-        parceiros
-          .map((p) => {
-            const beneficio = p.beneficio_bepit ? String(p.beneficio_bepit) : "—";
-            const endereco = p.endereco ? String(p.endereco) : "—";
-            return `- Nome: ${p.nome}\n  - Descrição: ${p.descricao}\n  - Endereço: ${endereco}\n  - Benefício Exclusivo BEPIT: ${beneficio}`;
-          })
-          .join("\n\n");
-    }
-
+    // 8) Montar resposta
+    const listaCidades = (cidades||[]).map(c=>c.nome).join(", ");
     const promptFinal = `
-[OBJETIVO]
-você é o bepit, concierge especialista e sincero da ${regiao.nome_regiao}. priorize sempre os parceiros encontrados.
+Você é o BEPIT (concierge) da região ${regiao.nome}.
+Responda curto (2-4 frases), priorizando parceiros/dicas encontrados.
+Se cidade foi informada, foque nela; se não, mencione que pode filtrar por: ${listaCidades}.
 
-[parceiro em foco]
-${parceiroEmFoco ? `nome: ${parceiroEmFoco.nome}` : "nenhum parceiro em foco no momento."}
+[Contexto]
+Cidade detectada: ${cidadeDetectada ? cidadeDetectada.nome : "nenhuma"}
+Itens (até 10):
+${contexto}
 
-[dados de parceiros encontrados]
-${contextoDeParceiros}
-
-[regras]
-1) se existirem parceiros, recomende diretamente como se fosse sua sugestão pessoal.
-2) se não existirem parceiros, use conhecimento geral da região.
-3) respostas curtas e diretas (2 a 4 frases).
-4) se a pergunta for curta do tipo “horário?”, “endereço?”, “contato?”, “fotos?”, “preço?”, assuma que é sobre o parceiro em foco.
-5) fale apenas sobre turismo e serviços na ${regiao.nome_regiao}. para outros assuntos, recuse gentilmente.
-
-[pergunta do usuário]
-"${textoDoUsuario}"
+[Pergunta do usuário]
+"${message}"
 `.trim();
 
-    const resultadoDaIa = await modeloGenerativo.generateContent(promptFinal);
-    const textoDaIa = resultadoDaIa.response.text();
+    const out = await modelo.generateContent(promptFinal);
+    const texto = out.response.text();
 
-    // fotos para o cliente
-    const fotosParaCliente =
-      parceiroEmFoco && Array.isArray(parceiroEmFoco.link_fotos)
-        ? parceiroEmFoco.link_fotos
-        : Array.isArray(parceiros)
-        ? parceiros.flatMap((p) =>
-            Array.isArray(p.link_fotos) ? p.link_fotos : []
-          )
-        : [];
+    // 9) Analytics: se houve parceiro em foco, conta view
+    if (parceiroEmFoco?.id) {
+      // incrementa views
+      await supabase.rpc("noop"); // placeholder se quiser testar sem função
+      const { data: cur } = await supabase.from("parceiro_views").select("*").eq("parceiro_id", parceiroEmFoco.id).single();
+      if (cur) {
+        await supabase.from("parceiro_views").update({ views_total: cur.views_total + 1, last_view_at: new Date().toISOString() }).eq("parceiro_id", parceiroEmFoco.id);
+      } else {
+        await supabase.from("parceiro_views").insert({ parceiro_id: parceiroEmFoco.id, views_total: 1, last_view_at: new Date().toISOString() });
+      }
+      await supabase.from("eventos_analytics").insert({
+        regiao_id: regiao.id,
+        cidade_id: parceiroEmFoco.cidade_id,
+        parceiro_id: parceiroEmFoco.id,
+        conversation_id: conversationId,
+        tipo_evento: "partner_view",
+        payload: { nome: parceiroEmFoco.nome }
+      });
+    }
 
-    // salva interação
-    const { data: novaInteracao, error: erroSalvarInteracao } = await supabase
-      .from("interacoes")
+    // 10) Salvar interação
+    const { data: inter } = await supabase.from("interacoes")
       .insert({
         regiao_id: regiao.id,
         conversation_id: conversationId,
-        pergunta_usuario: textoDoUsuario,
-        resposta_ia: textoDaIa,
-        parceiros_sugeridos: Array.isArray(parceiros) ? parceiros : []
-      })
-      .select("id")
-      .single();
+        pergunta_usuario: message,
+        resposta_ia: texto,
+        parceiros_sugeridos: itens
+      }).select("id").single();
 
-    if (erroSalvarInteracao) {
-      console.error("Erro ao salvar interação:", erroSalvarInteracao);
-    }
+    const fotos = parceiroEmFoco?.fotos && Array.isArray(parceiroEmFoco.fotos)
+      ? parceiroEmFoco.fotos
+      : (itens||[]).flatMap(p => Array.isArray(p.fotos) ? p.fotos : []);
 
-    // devolve ao cliente
-    return response.status(200).json({
-      reply: textoDaIa,
-      interactionId: novaInteracao?.id || null,
-      photoLinks: fotosParaCliente,
-      conversationId: conversationId
+    return res.status(200).json({
+      reply: texto,
+      interactionId: inter?.id || null,
+      photoLinks: fotos,
+      conversationId
     });
-  } catch (error) {
-    console.error("[/api/chat] Erro interno:", error);
-    return response
-      .status(500)
-      .json({ error: "Ocorreu um erro interno no servidor do BEPIT." });
+
+  } catch (e) {
+    console.error("[/api/chat/:regiaoSlug] Erro:", e);
+    return res.status(500).json({ error: "Erro interno" });
   }
 });
 
-// -----------------------------------------------------------------------------------
-// ROTA DE FEEDBACK
-// -----------------------------------------------------------------------------------
-application.post("/api/feedback", async (request, response) => {
+// Feedback → grava e também registra analytics
+app.post("/api/feedback", async (req, res) => {
   try {
-    const { interactionId, feedback } = request.body;
-
+    const { interactionId, feedback } = req.body;
     if (!interactionId || typeof interactionId !== "string") {
-      return response.status(400).json({
-        error:
-          "O campo 'interactionId' é obrigatório e deve ser uma string (uuid)."
-      });
+      return res.status(400).json({ error: "interactionId inválido" });
     }
-    if (!feedback || typeof feedback !== "string" || feedback.trim().length === 0) {
-      return response.status(400).json({
-        error:
-          "O campo 'feedback' é obrigatório e deve ser uma string não vazia."
-      });
+    if (!feedback || typeof feedback !== "string" || !feedback.trim()) {
+      return res.status(400).json({ error: "feedback vazio" });
     }
-
-    const { error } = await supabase
-      .from("interacoes")
-      .update({ feedback_usuario: feedback })
-      .eq("id", interactionId);
-
-    if (error) {
-      console.error("Erro ao registrar feedback:", error);
-      return response
-        .status(500)
-        .json({ error: "Erro ao registrar feedback." });
-    }
-
-    return response
-      .status(200)
-      .json({ success: true, message: "Feedback registrado com sucesso." });
-  } catch (error) {
-    console.error("[/api/feedback] Erro ao registrar feedback:", error);
-    return response.status(500).json({ error: "Erro ao registrar feedback." });
+    await supabase.from("interacoes").update({ feedback_usuario: feedback }).eq("id", interactionId);
+    await supabase.from("eventos_analytics").insert({ tipo_evento: "feedback", payload: { interactionId, feedback } });
+    res.json({ success: true });
+  } catch (e) {
+    console.error("[/api/feedback] Erro:", e);
+    res.status(500).json({ error: "Erro ao registrar feedback" });
   }
 });
 
-// -----------------------------------------------------------------------------------
-// SUBIR O SERVIDOR
-// -----------------------------------------------------------------------------------
-application.listen(servidorPorta, () => {
-  console.log(
-    `✅ 🤖 Servidor do BEPIT Nexus (v2.0) rodando em http://localhost:${servidorPorta}`
-  );
+// ====================== ADMIN BÁSICO ======================
+
+// Criar parceiro/dica
+app.post("/api/admin/parceiros", async (req, res) => {
+  try {
+    const body = req.body;
+    // Espera: { cidadeSlug, regiaoSlug, tipo, nome, ... }
+    const { regiaoSlug, cidadeSlug, ...rest } = body;
+    const { data: reg } = await supabase.from("regioes").select("id").eq("slug", regiaoSlug).single();
+    if (!reg) return res.status(400).json({ error: "regiaoSlug inválido" });
+    const { data: cid } = await supabase.from("cidades").select("id").eq("regiao_id", reg.id).eq("slug", cidadeSlug).single();
+    if (!cid) return res.status(400).json({ error: "cidadeSlug inválido" });
+
+    const novo = {
+      cidade_id: cid.id,
+      tipo: rest.tipo || "PARCEIRO",
+      nome: rest.nome,
+      descricao: rest.descricao || null,
+      categoria: rest.categoria || null,
+      beneficio_bepit: rest.beneficio_bepit || null,
+      endereco: rest.endereco || null,
+      contato: rest.contato || null,
+      tags: Array.isArray(rest.tags) ? rest.tags : null,
+      horario_funcionamento: rest.horario_funcionamento || null,
+      faixa_preco: rest.faixa_preco || null,
+      fotos: Array.isArray(rest.fotos) ? rest.fotos : null,
+      ativo: rest.ativo !== false
+    };
+
+    const { data, error } = await supabase.from("parceiros").insert(novo).select("*").single();
+    if (error) return res.status(500).json({ error: "Erro ao criar parceiro/dica" });
+    res.json({ ok: true, data });
+  } catch (e) {
+    console.error("[/api/admin/parceiros] Erro:", e);
+    res.status(500).json({ error: "Erro interno" });
+  }
+});
+
+// Lista parceiros por região/cidade
+app.get("/api/admin/parceiros/:regiaoSlug/:cidadeSlug", async (req, res) => {
+  try {
+    const { regiaoSlug, cidadeSlug } = req.params;
+    const { data: reg } = await supabase.from("regioes").select("id").eq("slug", regiaoSlug).single();
+    if (!reg) return res.status(400).json({ error: "regiaoSlug inválido" });
+    const { data: cid } = await supabase.from("cidades").select("id").eq("regiao_id", reg.id).eq("slug", cidadeSlug).single();
+    if (!cid) return res.status(400).json({ error: "cidadeSlug inválido" });
+
+    const { data, error } = await supabase.from("parceiros").select("*").eq("cidade_id", cid.id).order("nome");
+    if (error) return res.status(500).json({ error: "Erro ao listar" });
+    res.json({ data });
+  } catch (e) {
+    console.error("[/api/admin/parceiros/:regiao/:cidade] Erro:", e);
+    res.status(500).json({ error: "Erro interno" });
+  }
+});
+
+app.listen(PORT, () => {
+  console.log(`✅ BEPIT Nexus rodando em http://localhost:${PORT}`);
 });
