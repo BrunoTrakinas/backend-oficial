@@ -14,6 +14,23 @@ import { randomUUID } from "crypto";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import { supabase } from "../lib/supabaseClient.js";
 
+// Exemplo de rota para listar parceiros ativos
+application.get("/api/parceiros", async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from("parceiros")
+      .select("id, nome, categoria")
+      .eq("ativo", true)
+      .limit(20);
+
+    if (error) throw error;
+    res.json({ parceiros: data });
+  } catch (err) {
+    console.error("Erro Supabase:", err);
+    res.status(500).json({ error: "Erro ao buscar parceiros" });
+  }
+});
+
 // ============================================================================
 // MIDDLEWARE: protege rotas de admin com chave no header X-Admin-Key
 // ============================================================================
@@ -30,18 +47,32 @@ const application = express();
 const servidorPorta = process.env.PORT || 3002;
 
 // Origens permitidas (ajuste aqui se seu domínio mudar)
-const origensPermitidas = [
-  "http://localhost:5173",
-  "https://bepitnexus.netlify.app"
-];
+// CORS flexível p/ localhost e Netlify (produção + previews)
+const allowOrigin = (origin) => {
+  if (!origin) return true; // permite Postman/cURL
+
+  try {
+    const url = new URL(origin);
+    const host = url.host; // ex.: bepitnexus.netlify.app ou abc--bepitnexus.netlify.app
+
+    // localhost (qualquer porta)
+    if (url.hostname === "localhost") return true;
+
+    // domínio principal no Netlify
+    if (host === "bepitnexus.netlify.app") return true;
+
+    // qualquer preview/branch do Netlify (*.netlify.app)
+    if (host.endsWith(".netlify.app")) return true;
+
+    return false;
+  } catch {
+    return false;
+  }
+};
 
 application.use(
   cors({
-    origin: (origin, callback) => {
-      if (!origin) return callback(null, true); // permite Postman/curl
-      if (origensPermitidas.includes(origin)) return callback(null, true);
-      return callback(new Error("CORS bloqueado para essa origem."));
-    },
+    origin: (origin, cb) => (allowOrigin(origin) ? cb(null, true) : cb(new Error("CORS bloqueado para essa origem."))),
     credentials: true
   })
 );
