@@ -14,34 +14,6 @@ import { randomUUID } from "crypto";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import { supabase } from "../lib/supabaseClient.js";
 
-// Exemplo de rota para listar parceiros ativos
-application.get("/api/parceiros", async (req, res) => {
-  try {
-    const { data, error } = await supabase
-      .from("parceiros")
-      .select("id, nome, categoria")
-      .eq("ativo", true)
-      .limit(20);
-
-    if (error) throw error;
-    res.json({ parceiros: data });
-  } catch (err) {
-    console.error("Erro Supabase:", err);
-    res.status(500).json({ error: "Erro ao buscar parceiros" });
-  }
-});
-
-// ============================================================================
-// MIDDLEWARE: protege rotas de admin com chave no header X-Admin-Key
-// ============================================================================
-function exigirAdminKey(req, res, next) {
-  const header = req.headers["x-admin-key"];
-  if (!header || header !== process.env.ADMIN_API_KEY) {
-    return res.status(401).json({ error: "admin key inválida ou ausente" });
-  }
-  next();
-}
-
 // ============================== CONFIG BÁSICA ===============================
 const application = express();
 const servidorPorta = process.env.PORT || 3002;
@@ -69,6 +41,23 @@ const allowOrigin = (origin) => {
     return false;
   }
 };
+
+// ---- ROTA DE LISTA DE PARCEIROS (teste simples) ----
+application.get("/api/parceiros", async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from("parceiros")
+      .select("id, nome, categoria")
+      .eq("ativo", true)
+      .limit(20);
+
+    if (error) throw error;
+    res.json({ parceiros: data });
+  } catch (err) {
+    console.error("Erro Supabase:", err);
+    res.status(500).json({ error: "Erro ao buscar parceiros" });
+  }
+});
 
 application.use(
   cors({
