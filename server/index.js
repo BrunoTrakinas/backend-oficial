@@ -1,13 +1,12 @@
 // F:\uber-chat-mvp\backend-oficial\server\index.js
 // ============================================================================
 // BEPIT Nexus - Servidor (Express)
-// - IA “solta” com viés para PARCEIROS e DICAs (tabela única: parceiros)
-// - Roteiro (1..N dias) com slots manhã/tarde/noite priorizando parceiros
-// - Dicas de morador (tipo="DICA") entram automaticamente quando o tema pede
-// - Memória de conversa por conversationId (foco + sugeridos) com fallback em RAM
-// - Fallback sincero quando não houver parceiro
-// - Sem alucinar: nunca inventar — se não souber, assume e orienta
-// - Rotas ADMIN completas (parceiros CRUD, regiões, cidades, métricas, logs)
+// - Carrega .env antes de qualquer import que use process.env
+// - Suporta conversa com contexto (conversationId) e follow-ups diretos
+// - Organização por REGIÃO → CIDADES → PARCEIROS/DICAS (tabela "parceiros" com campo "tipo")
+// - Métricas básicas e proteção contra erros
+// - Entende follow-ups por número ("3") e por nome/categoria (fuzzy match)
+// - Gemini com fallback automático de modelos (sem precisar desabilitar IA)
 // ============================================================================
 
 import "dotenv/config";
@@ -23,14 +22,22 @@ const application = express();
 const servidorPorta = process.env.PORT || 3002;
 
 // --------------------------------- CORS ------------------------------------
-const allowOrigin = (origin) => {
-  if (!origin) return true; // Postman/cURL
+const permitirOrigem = (origin) => {
+  if (!origin) return true; // permite Postman/cURL sem Origin
+
   try {
     const url = new URL(origin);
-    const host = url.host;
+    const host = url.host; // ex.: bepitnexus.netlify.app ou abc--bepitnexus.netlify.app
+
+    // localhost (qualquer porta)
     if (url.hostname === "localhost") return true;
+
+    // domínio principal no Netlify
     if (host === "bepitnexus.netlify.app") return true;
+
+    // qualquer preview/branch do Netlify (*.netlify.app)
     if (host.endsWith(".netlify.app")) return true;
+
     return false;
   } catch {
     return false;
@@ -39,7 +46,8 @@ const allowOrigin = (origin) => {
 
 application.use(
   cors({
-    origin: (origin, cb) => (allowOrigin(origin) ? cb(null, true) : cb(new Error("CORS bloqueado para essa origem."))),
+    origin: (origin, cb) =>
+      permitirOrigem(origin) ? cb(null, true) : cb(new Error("CORS bloqueado para essa origem.")),
     credentials: true
   })
 );
@@ -47,24 +55,85 @@ application.use(
 // OPTIONS preflight
 application.options("*", cors());
 
-// Body parser
+// Body parser JSON
 application.use(express.json());
 
 // ------------------------------- GEMINI -------------------------------------
+// Mantemos a IA sempre ativa, com fallback automático de modelo.
 const geminiClient = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const DISABLE_GEMINI = process.env.DISABLE_GEMINI === "1";
 
-// ------------------------------ HELPERS -------------------------------------
-function logStep(label, extra = null) {
-  const time = new Date().toISOString();
-  if (extra !== null && extra !== undefined) console.log(`[${time}] [DEBUG] ${label}`, extra);
-  else console.log(`[${time}] [DEBUG] ${label}`);
+// Opcional: você pode definir GEMINI_MODEL no .env (ex.: gemini-1.5-flash-latest)
+const GEMINI_MODEL_ENV = (process.env.GEMINI_MODEL || "").trim();
+
+// Ordem de tentativa (da esquerda p/ direita) — a primeira que funcionar será memorizada
+const GEMINI_CANDIDATES = [
+  GEMINI_MODEL_ENV || null,
+  "gemini-1.5-flash-latest",
+  "gemini-1.5-flash",
+  "gemini-1.5-pro",
+  "gemini-pro"
+].filter(Boolean);
+
+// Cache do primeiro modelo que funcionou
+let GEMINI_MODEL_RESOLVED = null;
+
+/**
+ * Gera conteúdo na Gemini tentando modelos em fallback até um funcionar.
+ * Memoriza o modelo vencedor em GEMINI_MODEL_RESOLVED para chamadas futuras.
+ */
+async function geminiGenerateWithFallback(promptText) {
+  const listaTentativas = GEMINI_MODEL_RESOLVED ? [GEMINI_MODEL_RESOLVED] : GEMINI_CANDIDATES;
+  let ultimoErro = null;
+
+  for (const nomeModelo of listaTentativas) {
+    try {
+      const modelo = geminiClient.getGenerativeModel({ model: nomeModelo });
+      const resposta = await modelo.generateContent(promptText);
+      GEMINI_MODEL_RESOLVED = nomeModelo; // memoriza
+      logStep(`[GEMINI] usando modelo: ${nomeModelo}`);
+      return resposta;
+    } catch (e) {
+      ultimoErro = e;
+      const mensagem = String(e?.message || e);
+      const codigo = e?.status || e?.code || "";
+      const deveTentarProximo =
+        codigo === 404 ||
+        codigo === 403 ||
+        /not\sfound/i.test(mensagem) ||
+        /not\ssupported/i.test(mensagem) ||
+        /permission/i.test(mensagem);
+
+      console.warn(`[GEMINI] falha no modelo ${nomeModelo} (${codigo}): ${mensagem}`);
+      if (!deveTentarProximo && GEMINI_MODEL_RESOLVED) {
+        // Se um modelo que já funcionou anteriormente falhar de forma inesperada, paramos aqui
+        break;
+      }
+      // Caso contrário, seguimos para o próximo modelo
+    }
+  }
+
+  throw ultimoErro || new Error("Falha ao gerar conteúdo na Gemini (todas as tentativas).");
 }
 
-function normalizar(s) {
-  return String(s || "")
+// ===== DEBUG/SAFE MODE =====
+// Mantemos a flag, mas NÃO a ativamos no .env (a IA continua ligada)
+const DESABILITAR_GEMINI = process.env.DISABLE_GEMINI === "1";
+
+// ------------------------------ HELPERS -------------------------------------
+function logStep(rotulo, extra = null) {
+  const tempo = new Date().toISOString();
+  if (extra !== null && extra !== undefined) {
+    console.log(`[${tempo}] [DEBUG] ${rotulo}`, extra);
+  } else {
+    console.log(`[${tempo}] [DEBUG] ${rotulo}`);
+  }
+}
+
+function slugify(texto) {
+  return String(texto || "")
     .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
-    .toLowerCase().trim();
+    .toLowerCase().replace(/[^a-z0-9]+/g, "-")
+    .replace(/(^-|-$)+/g, "");
 }
 
 // ============================================================================
@@ -79,7 +148,7 @@ function exigirAdminKey(req, res, next) {
 }
 
 // ============================================================================
-// MEMÓRIA DE CONVERSA (fallback se Supabase falhar)
+// MEMÓRIA DE CONVERSA (fallback se Supabase falhar em algum ponto do fluxo)
 // ============================================================================
 const memoriaConversas = new Map(); // conversationId -> { parceiro_em_foco, parceiros_sugeridos }
 
@@ -98,36 +167,20 @@ function salvarConversaMem(conversationId, payload) {
 // ============================================================================
 // INTENÇÕES, SELEÇÃO E FUZZY MATCH
 // ============================================================================
-function detectarIntencao(texto) {
-  const t = normalizar(texto);
+function detectarIntencaoDeFollowUp(textoDoUsuario) {
+  const t = String(textoDoUsuario || "").toLowerCase();
 
-  // Roteiro
-  const padroesRoteiro = [
-    "roteiro", "itinerario", "itinerário", "planeja", "planejar", "planejamento",
-    "o que fazer", "x dias", "1 dia", "2 dias", "3 dias", "4 dias", "5 dias",
-    "fim de semana", "final de semana", "agenda do dia"
-  ];
-  if (padroesRoteiro.some((p) => t.includes(p))) return "roteiro";
-
-  // Follow-ups de detalhe
   const mapa = [
-    { intencao: "horario", padroes: ["horario", "horário", "abre", "fecha", "funciona", "funcionamento", "que horas"] },
-    { intencao: "endereco", padroes: ["endereco", "endereço", "onde fica", "localizacao", "localização", "como chegar"] },
+    { intencao: "horario", padroes: ["horário", "horario", "hora", "abre", "fecha", "funciona", "funcionamento", "que horas"] },
+    { intencao: "endereco", padroes: ["onde fica", "endereço", "endereco", "localização", "localizacao", "como chegar", "fica onde"] },
     { intencao: "contato", padroes: ["contato", "telefone", "whatsapp", "whats", "ligar"] },
     { intencao: "fotos", padroes: ["foto", "fotos", "imagem", "imagens", "galeria"] },
-    { intencao: "preco", padroes: ["preco", "preço", "faixa de preco", "faixa de preço", "caro", "barato", "valor", "quanto custa"] }
+    { intencao: "preco", padroes: ["preço", "preco", "faixa de preço", "faixa de preco", "caro", "barato", "valor", "quanto custa"] }
   ];
-  for (const item of mapa) if (item.padroes.some((p) => t.includes(p))) return item.intencao;
 
-  // “Dicas de morador”
-  const dicasGatilhos = [
-    "transito", "trânsito", "engarrafamento", "rota alternativa", "desvio",
-    "padaria", "cafe da manha", "café da manhã", "cafe", "café",
-    "horario bom", "melhor horario", "melhor horário", "estacionamento",
-    "seguranca", "segurança", "evitar", "lotado", "lotação"
-  ];
-  if (dicasGatilhos.some((p) => t.includes(p))) return "dica";
-
+  for (const item of mapa) {
+    for (const termo of item.padroes) if (t.includes(termo)) return item.intencao;
+  }
   return "nenhuma";
 }
 
@@ -141,8 +194,8 @@ const mapaOrdinal = new Map([
 ]);
 
 function extrairIndiceEscolhido(texto) {
-  const t = normalizar(texto);
-  const m1 = t.match(/(op[cç][aã]o|opcao|opção|numero|n[uú]mero|n[ºo]|#)\s*(\d{1,2})/i);
+  const t = String(texto || "").toLowerCase().trim();
+  const m1 = t.match(/(op[cç][aã]o|opcao|opção|n[uú]mero|numero|n[ºo]|#)\s*(\d{1,2})/i);
   if (m1 && m1[2]) {
     const idx = parseInt(m1[2], 10) - 1;
     if (idx >= 0) return idx;
@@ -156,8 +209,13 @@ function extrairIndiceEscolhido(texto) {
   return null;
 }
 
-// Dice coefficient (bigrams) para fuzzy matching simples (não usamos muito aqui)
-// Mantido para evoluções futuras
+function normalizar(s) {
+  return String(s || "")
+    .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase().trim();
+}
+
+// Dice coefficient (bigrams) para fuzzy matching simples
 function bigrams(str) {
   const s = normalizar(str);
   const grams = [];
@@ -172,6 +230,42 @@ function diceSimilarity(a, b) {
   for (const g of A) freq.set(g, (freq.get(g) || 0) + 1);
   for (const g of B) { const v = freq.get(g) || 0; if (v > 0) { inter += 1; freq.set(g, v - 1); } }
   return (2 * inter) / (A.length + B.length);
+}
+
+function tentarAcharParceiroPorNomeOuCategoria(texto, lista) {
+  const t = normalizar(texto);
+  if (!t) return null;
+
+  const sinonimos = ["churrascaria", "pizzaria", "praia", "restaurante", "bar", "balada", "trilha", "mergulho"];
+
+  // 1) Contém nome diretamente
+  for (const p of lista || []) {
+    const nome = normalizar(p.nome);
+    if (t.includes(nome) || nome.includes(t)) return p;
+  }
+
+  // 2) Categoria direta ou por sinônimo
+  for (const p of lista || []) {
+    const cat = normalizar(p.categoria || "");
+    if (!cat) continue;
+    if (t.includes(cat) || cat.includes(t)) return p;
+    for (const s of sinonimos) if (t.includes(s) && (cat.includes(s) || s.includes(cat))) return p;
+  }
+
+  // 3) Fuzzy por similaridade com nome e categoria
+  let melhor = null;
+  let melhorScore = 0;
+  for (const p of lista || []) {
+    const nome = normalizar(p.nome);
+    const cat = normalizar(p.categoria || "");
+    const score = Math.max(diceSimilarity(t, nome), diceSimilarity(t, cat));
+    if (score > melhorScore) {
+      melhorScore = score;
+      melhor = p;
+    }
+  }
+  // Threshold conservador para pegar “churascaria” ~ “churrascaria”
+  return melhorScore >= 0.45 ? melhor : null;
 }
 
 function resumoDoParceiro(parceiro) {
@@ -191,7 +285,7 @@ application.get("/health", (req, res) => {
 });
 
 // ============================================================================
-// ROTA DE LISTA DE PARCEIROS (diagnóstico)
+// ROTA DE LISTA DE PARCEIROS (diagnóstico rápido)
 // ============================================================================
 application.get("/api/parceiros", async (req, res) => {
   try {
@@ -209,10 +303,10 @@ application.get("/api/parceiros", async (req, res) => {
 });
 
 // ============================================================================
-// ANALISAR ENTRADA (IA ou fallback)
+// ANALISAR ENTRADA (IA ou fallback simples)
 // ============================================================================
 async function analisarEntradaUsuario(texto, cidades) {
-  if (DISABLE_GEMINI) {
+  if (DESABILITAR_GEMINI) {
     const lower = String(texto || "").toLowerCase();
     const cidadeSlug =
       (cidades || []).find(
@@ -222,21 +316,34 @@ async function analisarEntradaUsuario(texto, cidades) {
   }
 
   try {
-    const modelo = geminiClient.getGenerativeModel({ model: "gemini-1.5-flash" });
     const listaCidades = (cidades || []).map((c) => ({ nome: c.nome, slug: c.slug }));
 
     const prompt = `
 Você é um analisador de linguagem natural para turismo no Brasil.
 Tarefas:
-1) Corrija erros simples mantendo a intenção.
-2) Inferir (se possível): companhia ("casal"|"familia"|"amigos"|"sozinho"|null), vibe ("romantico"|"tranquilo"|"agitado"|"aventura"|null), orcamento ("baixo"|"medio"|"alto"|null).
-3) Sugerir cidade (slug exato) a partir destas: ${JSON.stringify(listaCidades)} (ou null).
-4) Palavras_chave (até 5, minúsculas).
-Responda somente JSON: {"corrigido":"...","companhia":"...","vibe":"...","orcamento":"...","cidadeSlugSugerida":"...","palavrasChave":["..."]}
-Frase: "${texto}"
+1) Corrija apenas erros claros de digitação mantendo a intenção original.
+2) Inferir (se possível) o perfil do usuário:
+   - companhia: "casal" | "familia" | "amigos" | "sozinho" | null
+   - vibe: "romantico" | "tranquilo" | "agitado" | "aventura" | null
+   - orcamento: "baixo" | "medio" | "alto" | null
+3) Sugerir cidade (se houver) com base nestas opções (use o slug exato ou null):
+   ${JSON.stringify(listaCidades)}
+4) Gerar até 5 palavras_chave (minúsculas, simples).
+
+Responda APENAS JSON, sem comentários, nesse formato:
+{
+  "corrigido": "...",
+  "companhia": "...",
+  "vibe": "...",
+  "orcamento": "...",
+  "cidadeSlugSugerida": "...",
+  "palavrasChave": ["...","..."]
+}
+
+Frase original: "${texto}"
 `.trim();
 
-    const resp = await modelo.generateContent(prompt);
+    const resp = await geminiGenerateWithFallback(prompt);
     let out = (await resp.response.text()).trim();
     out = out.replace(/```json|```/g, "");
     const parsed = JSON.parse(out);
@@ -256,7 +363,7 @@ Frase: "${texto}"
 }
 
 // ============================================================================
-// CHAT – resposta natural + apêndice de parceiros
+// CHAT
 // ============================================================================
 application.post("/api/chat/:slugDaRegiao", async (request, response) => {
   console.log("\n--- NOVA INTERAÇÃO ---");
@@ -267,7 +374,6 @@ application.post("/api/chat/:slugDaRegiao", async (request, response) => {
     if (!textoDoUsuario || typeof textoDoUsuario !== "string" || !textoDoUsuario.trim()) {
       return response.status(400).json({ error: "O campo 'message' é obrigatório e deve ser uma string não vazia." });
     }
-    const textoUserTrim = textoDoUsuario.trim();
 
     // 1) Região
     const { data: regiao, error: erroRegiao } = await supabase
@@ -291,7 +397,7 @@ application.post("/api/chat/:slugDaRegiao", async (request, response) => {
     }
 
     // 3) Cidade pelo texto
-    const textoMinusculo = textoUserTrim.toLowerCase();
+    const textoMinusculo = textoDoUsuario.toLowerCase();
     let cidadeDetectada = null;
     for (const c of cidades || []) {
       if (textoMinusculo.includes(String(c.nome).toLowerCase()) || textoMinusculo.includes(String(c.slug).toLowerCase())) {
@@ -299,7 +405,7 @@ application.post("/api/chat/:slugDaRegiao", async (request, response) => {
       }
     }
 
-    const analise = await analisarEntradaUsuario(textoUserTrim, cidades);
+    const analise = await analisarEntradaUsuario(textoDoUsuario, cidades);
     if (!cidadeDetectada && analise.cidadeSlugSugerida) {
       const cand = (cidades || []).find((c) => c.slug === analise.cidadeSlugSugerida);
       if (cand) cidadeDetectada = cand;
@@ -350,36 +456,38 @@ application.post("/api/chat/:slugDaRegiao", async (request, response) => {
       await supabase.from("buscas_texto").insert({
         regiao_id: regiao.id,
         cidade_id: cidadeDetectada?.id || null,
-        texto: textoUserTrim
+        texto: textoDoUsuario
       });
       await supabase.from("eventos_analytics").insert({
         regiao_id: regiao.id,
         cidade_id: cidadeDetectada?.id || null,
         conversation_id: conversationId,
         tipo_evento: "search",
-        payload: { q: textoUserTrim }
+        payload: { q: textoDoUsuario }
       });
     } catch (e) {
       console.error("[SUPABASE] Falha ao registrar métricas de busca (segue):", e);
     }
 
     // 7) intenção
-    const intencao = detectarIntencaoDeFollowUp(textoUserTrim);
+    const intencao = detectarIntencaoDeFollowUp(textoDoUsuario);
 
-    // 7.1 Seleção por número/nome quando já há sugeridos e a intenção é genérica
+    // 7.1 Permitir troca/definição de foco por número ou nome (mesmo com foco já definido),
+    // desde que a intenção não seja de detalhe direto (horário/endereço/contato/fotos/preço)
     const candidatos = Array.isArray(conversaAtual.parceiros_sugeridos) ? conversaAtual.parceiros_sugeridos : [];
     if (candidatos.length > 0 && intencao === "nenhuma") {
       let escolhido = null;
 
-      const idx = extrairIndiceEscolhido(textoUserTrim);
+      const idx = extrairIndiceEscolhido(textoDoUsuario);
       if (idx !== null && idx >= 0 && idx < candidatos.length) {
         escolhido = candidatos[idx];
       }
       if (!escolhido) {
-        escolhido = tentarAcharParceiroPorNomeOuCategoria(textoUserTrim, candidatos);
+        escolhido = tentarAcharParceiroPorNomeOuCategoria(textoDoUsuario, candidatos);
       }
 
       if (escolhido) {
+        // Atualiza conversa com novo foco
         try {
           const { error: erroUpdConv } = await supabase
             .from("conversas")
@@ -409,7 +517,7 @@ application.post("/api/chat/:slugDaRegiao", async (request, response) => {
           await supabase.from("interacoes").insert({
             regiao_id: regiao.id,
             conversation_id: conversationId,
-            pergunta_usuario: textoUserTrim,
+            pergunta_usuario: textoDoUsuario,
             resposta_ia: respostaDireta,
             parceiros_sugeridos: conversaAtual.parceiros_sugeridos || []
           });
@@ -477,9 +585,11 @@ application.post("/api/chat/:slugDaRegiao", async (request, response) => {
       }
     }
 
-    // 8) Palavras-chave e termos de reforço
+    // 8) Buscar itens (parceiros/dicas)
     logStep("INÍCIO - extração de palavras-chave");
     let termos = [];
+
+    // Reforços baseados no perfil inferido
     const reforcosPorPerfil = [];
     if (analise?.palavrasChave?.length) for (const k of analise.palavrasChave) reforcosPorPerfil.push(String(k).toLowerCase());
     if (perfilUsuario.companhia === "casal" || perfilUsuario.vibe === "romantico") reforcosPorPerfil.push("romantico", "jantar", "vista", "pôr do sol", "vinho");
@@ -490,19 +600,18 @@ application.post("/api/chat/:slugDaRegiao", async (request, response) => {
     if (perfilUsuario.orcamento === "alto") reforcosPorPerfil.push("premium", "sofisticado", "menu degustação");
     termos = Array.from(new Set([...reforcosPorPerfil]));
 
-    if (!DISABLE_GEMINI) {
+    if (!DESABILITAR_GEMINI) {
       try {
-        const modeloKW = geminiClient.getGenerativeModel({ model: "gemini-1.5-flash" });
         const promptKW = `
 extraia até 3 palavras-chave de turismo da frase abaixo.
 regras:
 - responda apenas com as palavras separadas por vírgula.
 - tudo em minúsculas, sem explicações.
 - se não achar nada, responda "geral".
-frase: "${textoUserTrim}"
+frase: "${textoDoUsuario}"
 `.trim();
 
-        const resultadoKW = await modeloKW.generateContent(promptKW);
+        const resultadoKW = await geminiGenerateWithFallback(promptKW);
         const textoKW = (await resultadoKW.response.text()).trim();
         const linhaKW = (textoKW.split("\n")[0] || "").replace(/["'“”‘’]/g, "");
         const baseKW = linhaKW.split(",").map((x) => x.trim().toLowerCase()).filter(Boolean);
@@ -522,7 +631,7 @@ frase: "${textoUserTrim}"
       logStep("DISABLE_GEMINI=1 → pulando extração de palavras-chave");
     }
 
-    // 9) Buscar itens locais (parceiros e dicas)
+    // 9) Query de parceiros/dicas
     const cidadeIds = cidadeDetectada ? [cidadeDetectada.id] : (cidades || []).map((c) => c.id);
 
     let consulta = supabase
@@ -548,7 +657,7 @@ frase: "${textoUserTrim}"
     }
     itens = Array.isArray(itens) ? itens : [];
 
-    // Incluir via tags jsonb (OR)
+    // OR em tags jsonb, evitando duplicatas por nome+categoria+endereco
     if (termos.length > 0) {
       for (const t of termos) {
         const { data: itensTag, error: erroTag } = await supabase
@@ -584,97 +693,75 @@ frase: "${textoUserTrim}"
       salvarConversaMem(conversationId, { parceiro_em_foco: parceiroEmFoco, parceiros_sugeridos: itens });
     }
 
-    // 11) Montar contexto textual dos itens (para IA)
+    // 11) Montar contexto para IA
     const contextoDeItens =
       itens.length > 0
-        ? itens.slice(0, 8).map((p, i) => {
+        ? itens.slice(0, 10).map((p) => {
             const etiqueta = p.tipo === "DICA" ? "[DICA]" : "[PARCEIRO]";
-            const beneficio = p.beneficio_bepit ? ` | Benefício: ${p.beneficio_bepit}` : "";
-            const endereco = p.endereco ? ` | Endereço: ${p.endereco}` : "";
-            return `${i + 1}. ${etiqueta} ${p.nome} — ${p.categoria || "—"}${beneficio}${endereco}`;
+            const endereco = p.endereco ? String(p.endereco) : "—";
+            const beneficio = p.beneficio_bepit ? ` | Benefício BEPIT: ${p.beneficio_bepit}` : "";
+            return `${etiqueta} ${p.nome} — ${p.categoria || "—"} — ${endereco}${beneficio}`;
           }).join("\n")
         : "Nenhum parceiro ou dica encontrado.";
 
-    const nomesCidades = (cidades || []).map((c) => c.nome).join(", ");
+    const listaCidades = (cidades || []).map((c) => c.nome).join(", ");
 
-    // Heurística simples para saudações: evita listar parceiros nessas mensagens
-    const ehSaudacaoOuSmalltalk = (() => {
-      const t = textoMinusculo;
-      const termos = ["olá", "ola", "oi", "bom dia", "boa tarde", "boa noite", "tudo bem", "e aí", "eaí"];
-      return termos.some((k) => t.includes(k));
-    })();
+    function montarRespostaFallback({ regiao, cidadeDetectada, itens, listaCidades }) {
+      if (itens && itens.length > 0) {
+        const top = itens.slice(0, 3).map((p, i) => {
+          const benef = p.beneficio_bepit ? ` — Benefício BEPIT: ${p.beneficio_bepit}` : "";
+          return `${i + 1}. ${p.nome} (${p.categoria || "categoria não informada"})${benef}`;
+        }).join(" ");
+        const foco = cidadeDetectada ? ` em ${cidadeDetectada.nome}` : "";
+        return `Aqui vão algumas opções${foco}: ${top}. Para detalhes, responda com o **número** (ex.: 2) ou o **nome**. Posso também filtrar por cidade (${listaCidades}).`;
+      }
+      const foco = cidadeDetectada ? ` em ${cidadeDetectada.nome}` : "";
+      return `Ainda não encontrei itens${foco}. Posso procurar por categoria (ex.: restaurante, passeio) ou filtrar por cidade (${listaCidades}).`;
+    }
 
-    // 12) Geração de resposta natural (IA) + Apêndice de parceiros
+    // 12) Geração de resposta final (IA + fallback)
     logStep("INÍCIO - geração de resposta final");
-    let respostaNatural = "";
-    let apendiceParceiros = "";
+    let textoIA = "";
 
-    // a) Resposta natural sempre vem primeiro
-    if (!DISABLE_GEMINI) {
+    if (!DESABILITAR_GEMINI) {
       try {
-        const modeloIA = geminiClient.getGenerativeModel({ model: "gemini-1.5-flash" });
-        const promptNatural = `
-Você é o BEPIT, concierge local, educado e sincero da região ${regiao.nome}.
-Regras de resposta:
-- Responda de forma direta e útil à pergunta do usuário.
-- Se a pergunta for sobre distância, rotas, quando ir, tempo de visita, segurança, melhor época, etc., responda objetivamente.
-- Se for saudação ou conversa social, responda de forma breve e amigável, e convide a dizer o que procura.
-- Não invente fatos específicos sobre parceiros; dados locais detalhados virão em um bloco de sugestões depois (não invente).
+        const promptFinal = `
+Você é o BEPIT, concierge especialista e sincero da região ${regiao.nome}.
 
-Contexto local:
-- Cidades disponíveis: ${nomesCidades}.
-- Cidade detectada nesta mensagem: ${cidadeDetectada ? cidadeDetectada.nome : "nenhuma"}.
-- Perfil do usuário (se conhecido): companhia=${perfilUsuario.companhia || "?"}, vibe=${perfilUsuario.vibe || "?"}, orçamento=${perfilUsuario.orcamento || "?"}.
+Regras:
+1) Priorize itens encontrados (parceiros e dicas).
+2) Use o perfil do usuário (abaixo) para refinar a recomendação (ex.: casal + romântico → jantar romântico, barco tranquilo).
+3) Se houver cidade detectada, foque nela; senão, diga que posso filtrar por: ${listaCidades}.
+4) Respostas curtas e diretas (2 a 4 frases). Cite benefícios BEPIT quando existirem.
+5) Fale apenas sobre turismo e serviços desta região.
+6) Sempre que listar 2+ opções, **incentive a seleção por número ou nome** explicitamente.
 
-Pergunta do usuário:
-"${textoUserTrim}"
+[Perfil do usuário]
+companhia: ${perfilUsuario.companhia || "desconhecida"}
+vibe: ${perfilUsuario.vibe || "desconhecida"}
+orcamento: ${perfilUsuario.orcamento || "desconhecido"}
 
-Responda em 1 a 4 frases, em português do Brasil, sem listas numeradas nesta parte.
+[Cidade detectada]
+${cidadeDetectada ? cidadeDetectada.nome : "nenhuma"}
+
+[Itens disponíveis (até 10)]
+${contextoDeItens}
+
+[Pergunta do usuário]
+"${textoDoUsuario}"
 `.trim();
 
-        const respIA = await modeloIA.generateContent(promptNatural);
-        respostaNatural = (respIA.response.text() || "").trim();
-        if (!respostaNatural) throw new Error("IA retornou vazio na parte natural.");
+        const respIA = await geminiGenerateWithFallback(promptFinal);
+        textoIA = respIA.response.text();
+        logStep("Resposta IA gerada");
       } catch (e) {
-        console.error("[IA Gemini] Falha na resposta natural, usando fallback curto:", e);
-        // Fallback curto e neutro
-        if (ehSaudacaoOuSmalltalk) {
-          respostaNatural = "Olá! Posso te ajudar com **restaurantes**, **passeios**, **praias**, **hospedagem** e mais. O que você procura?";
-        } else if (cidadeDetectada) {
-          respostaNatural = `Posso te orientar sobre ${cidadeDetectada.nome}: onde comer, o que fazer e como se locomover. Diga o que você quer que eu detalhe.`;
-        } else {
-          respostaNatural = `Posso te guiar pela ${regiao.nome}. Diga se você busca restaurantes, passeios, praias ou hospedagem — e posso filtrar por cidade (${nomesCidades}).`;
-        }
+        console.error("[IA Gemini] Falha ao gerar resposta (usando fallback):", e);
+        textoIA = montarRespostaFallback({ regiao, cidadeDetectada, itens, listaCidades });
       }
     } else {
-      // Gemini desativado: fallback natural
-      if (ehSaudacaoOuSmalltalk) {
-        respostaNatural = "Olá! Posso te ajudar com **restaurantes**, **passeios**, **praias**, **hospedagem** e mais. O que você procura?";
-      } else if (cidadeDetectada) {
-        respostaNatural = `Posso te orientar sobre ${cidadeDetectada.nome}: onde comer, o que fazer e como se locomover. Diga o que você quer que eu detalhe.`;
-      } else {
-        respostaNatural = `Posso te guiar pela ${regiao.nome}. Diga se você busca restaurantes, passeios, praias ou hospedagem — e posso filtrar por cidade (${nomesCidades}).`;
-      }
+      logStep("DISABLE_GEMINI=1 → usando fallback de resposta");
+      textoIA = montarRespostaFallback({ regiao, cidadeDetectada, itens, listaCidades });
     }
-
-    // b) Apêndice “Sugestões locais” (somente se não for pura saudação ou se usuário pediu algo turístico)
-    if (itens.length > 0 && (!ehSaudacaoOuSmalltalk || termos.length > 0)) {
-      const top = itens.slice(0, 3).map((p, i) => {
-        const benef = p.beneficio_bepit ? ` — Benefício BEPIT: ${p.beneficio_bepit}` : "";
-        const cat = p.categoria || "categoria não informada";
-        return `${i + 1}. ${p.nome} (${cat})${benef}`;
-      }).join("\n");
-      apendiceParceiros =
-        `\n\n**Sugestões locais**\n${top}\n\n` +
-        `Se quiser, responda com o **número** (ex.: 2) ou o **nome** (ex.: "a churrascaria"). ` +
-        `Também posso filtrar por cidade (${nomesCidades}).`;
-    } else if (itens.length === 0 && !ehSaudacaoOuSmalltalk) {
-      apendiceParceiros =
-        `\n\n_Não encontrei parceiros dessa categoria agora._ ` +
-        `Posso sugerir opções gerais da região, e quando houver oportunidade trago parceiros confiáveis com benefício BEPIT.`;
-    }
-
-    const respostaFinal = `${respostaNatural}${apendiceParceiros}`.trim();
 
     // 13) Métrica de view do foco
     try {
@@ -720,8 +807,8 @@ Responda em 1 a 4 frases, em português do Brasil, sem listas numeradas nesta pa
         .insert({
           regiao_id: regiao.id,
           conversation_id: conversationId,
-          pergunta_usuario: textoUserTrim,
-          resposta_ia: respostaFinal,
+          pergunta_usuario: textoDoUsuario,
+          resposta_ia: textoIA,
           parceiros_sugeridos: itens
         })
         .select("id")
@@ -732,14 +819,14 @@ Responda em 1 a 4 frases, em português do Brasil, sem listas numeradas nesta pa
       console.error("[SUPABASE] Falha ao salvar interação (segue):", e);
     }
 
-    // 15) Fotos p/ cliente
+    // 15) Fotos para o cliente
     const fotosParaCliente =
       parceiroEmFoco && Array.isArray(parceiroEmFoco.fotos_parceiros)
         ? parceiroEmFoco.fotos_parceiros
         : itens.flatMap((p) => (Array.isArray(p.fotos_parceiros) ? p.fotos_parceiros : []));
 
     return response.status(200).json({
-      reply: respostaFinal,
+      reply: textoIA,
       interactionId,
       photoLinks: fotosParaCliente,
       conversationId
@@ -790,7 +877,7 @@ application.post("/api/feedback", async (request, response) => {
 });
 
 // ============================================================================
-// ADMIN (LOGIN)
+// ADMIN (MVP)
 // ============================================================================
 application.post("/api/admin/login", async (req, res) => {
   try {
@@ -807,9 +894,7 @@ application.post("/api/admin/login", async (req, res) => {
   }
 });
 
-// ============================================================================
-// ADMIN: PARCEIROS - CRIAR
-// ============================================================================
+// CRIAR parceiro/dica
 application.post("/api/admin/parceiros", exigirAdminKey, async (request, response) => {
   try {
     const body = request.body;
@@ -852,9 +937,7 @@ application.post("/api/admin/parceiros", exigirAdminKey, async (request, respons
   }
 });
 
-// ============================================================================
-// ADMIN: PARCEIROS - LISTAR por região+cidade
-// ============================================================================
+// LISTAR parceiros por região+cidade
 application.get("/api/admin/parceiros/:regiaoSlug/:cidadeSlug", exigirAdminKey, async (request, response) => {
   try {
     const { regiaoSlug, cidadeSlug } = request.params;
@@ -879,14 +962,13 @@ application.get("/api/admin/parceiros/:regiaoSlug/:cidadeSlug", exigirAdminKey, 
   }
 });
 
-// ============================================================================
-// ADMIN: PARCEIROS - EDITAR por id
-// ============================================================================
+// EDITAR parceiro por id
 application.put("/api/admin/parceiros/:id", exigirAdminKey, async (req, res) => {
   try {
     const { id } = req.params;
     const body = req.body || {};
 
+    // Apenas campos permitidos para edição
     const atualizacao = {
       nome: body.nome ?? null,
       categoria: body.categoria ?? null,
@@ -897,7 +979,9 @@ application.put("/api/admin/parceiros/:id", exigirAdminKey, async (req, res) => 
       tags: Array.isArray(body.tags) ? body.tags : null,
       horario_funcionamento: body.horario_funcionamento ?? null,
       faixa_preco: body.faixa_preco ?? null,
-      fotos_parceiros: Array.isArray(body.fotos_parceiros) ? body.fotos_parceiros : (Array.isArray(body.fotos) ? body.fotos : null),
+      fotos_parceiros: Array.isArray(body.fotos_parceiros)
+        ? body.fotos_parceiros
+        : (Array.isArray(body.fotos) ? body.fotos : null),
       ativo: body.ativo !== false
     };
 
@@ -969,7 +1053,7 @@ application.get("/api/admin/metrics/summary", exigirAdminKey, async (req, res) =
     const { regiaoSlug, cidadeSlug } = req.query;
     if (!regiaoSlug) return res.status(400).json({ error: "regiaoSlug é obrigatório" });
 
-    // Região
+    // Carrega região
     const { data: regiao, error: eReg } = await supabase
       .from("regioes")
       .select("id, nome, slug")
@@ -977,7 +1061,7 @@ application.get("/api/admin/metrics/summary", exigirAdminKey, async (req, res) =
       .single();
     if (eReg || !regiao) return res.status(404).json({ error: "região não encontrada" });
 
-    // Cidades
+    // Carrega cidades da região
     const { data: cidades, error: eCid } = await supabase
       .from("cidades")
       .select("id, nome, slug")
@@ -1066,13 +1150,21 @@ application.get("/api/admin/metrics/summary", exigirAdminKey, async (req, res) =
 // ============================================================================
 // ADMIN: LOGS / EVENTOS (auditoria simples)
 // GET /api/admin/logs?tipo=search&regiaoSlug=...&cidadeSlug=...&parceiroId=...&conversationId=...&since=...&until=...&limit=50
-// (Corrigido: sem trechos de código estranhos; apenas consulta limpa.)
 // ============================================================================
 application.get("/api/admin/logs", exigirAdminKey, async (req, res) => {
   try {
-    const { tipo, regiaoSlug, cidadeSlug, parceiroId, conversationId, since, until, limit } = req.query;
+    const {
+      tipo,
+      regiaoSlug,
+      cidadeSlug,
+      parceiroId,
+      conversationId,
+      since,
+      until,
+      limit
+    } = req.query;
 
-    // Normaliza limite
+    // Normaliza o limite (padrão 50, máximo 200)
     let lim = Number(limit || 50);
     if (!Number.isFinite(lim) || lim <= 0) lim = 50;
     if (lim > 200) lim = 200;
@@ -1110,7 +1202,7 @@ application.get("/api/admin/logs", exigirAdminKey, async (req, res) => {
       cidadeId = cidade.id;
     }
 
-    // Consulta
+    // Monta consulta
     let query = supabase
       .from("eventos_analytics")
       .select("id, created_at, regiao_id, cidade_id, parceiro_id, conversation_id, tipo_evento, payload")
