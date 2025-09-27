@@ -61,10 +61,6 @@ application.use(express.json());
 // ------------------------------- GEMINI -------------------------------------
 // Mantemos a IA sempre ativa, com fallback automático de modelo.
 const geminiClient = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-<<<<<<< HEAD
-=======
-const DISABLE_GEMINI = process.env.DISABLE_GEMINI === "0";
->>>>>>> 91a01843987d2211a60c54535bcf303b1b17cf93
 
 // Opcional: você pode definir GEMINI_MODEL no .env (ex.: gemini-1.5-flash-latest)
 const GEMINI_MODEL_ENV = (process.env.GEMINI_MODEL || "").trim();
