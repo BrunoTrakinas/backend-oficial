@@ -44,7 +44,11 @@ const allowOrigin = (origin) => {
 
 application.use(
   cors({
-    origin: (origin, cb) => (allowOrigin(origin) ? cb(null, true) : cb(new Error("CORS bloqueado para essa origem."))),
+    origin: (origin, cb) => {
+      const permitido = allowOrigin(origin);
+      console.log(`[CORS] origin=${origin || "(sem origin)"} → ${permitido ? "allow" : "deny"}`);
+      return permitido ? cb(null, true) : cb(new Error("CORS bloqueado para essa origem."));
+    },
     credentials: true
   })
 );
@@ -61,6 +65,11 @@ const geminiClient = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 // ===== DEBUG/SAFE MODE =====
 // Ative DISABLE_GEMINI=1 no .env para pular chamadas à IA (útil p/ testes)
 const DISABLE_GEMINI = process.env.DISABLE_GEMINI === "1";
+
+// Log de boot para ver rapidamente estado da IA e chaves
+console.log(
+  `[BOOT] DISABLE_GEMINI=${DISABLE_GEMINI ? "1" : "0"} | GEMINI_API_KEY=${process.env.GEMINI_API_KEY ? "SET" : "MISSING"}`
+);
 
 // ------------------------------ HELPERS -------------------------------------
 function logStep(label, extra = null) {
@@ -140,11 +149,14 @@ function detectarIntencaoDeFollowUp(textoDoUsuario) {
 // === Analisar entrada do usuário (corrigir, inferir perfil, cidade e palavras) ===
 async function analisarEntradaUsuario(texto, cidades) {
   // Fallback simples quando a IA estiver desligada
-  if (process.env.DISABLE_GEMINI === "1") {
+  if (DISABLE_GEMINI) {
     const lower = String(texto || "").toLowerCase();
-    const cidadeSlug = (cidades || []).find(
-      (c) => lower.includes(String(c.nome).toLowerCase()) || lower.includes(String(c.slug).toLowerCase())
-    )?.slug || null;
+    const cidadeSlug =
+      (cidades || []).find(
+        (c) =>
+          lower.includes(String(c.nome).toLowerCase()) ||
+          lower.includes(String(c.slug).toLowerCase())
+      )?.slug || null;
     return {
       corrigido: texto,
       companhia: null,
@@ -189,7 +201,15 @@ Frase original: "${texto}"
 
     // Remove cercas de código se vierem
     out = out.replace(/```json|```/g, "");
-    const parsed = JSON.parse(out);
+
+    // Parse robusto: se vier algo inesperado, não derruba a rota
+    let parsed = null;
+    try {
+      parsed = JSON.parse(out);
+    } catch (jsonErr) {
+      console.error("[IA Gemini] JSON inválido na análise; usando fallback seguro. Conteúdo bruto:", out);
+      parsed = {};
+    }
 
     return {
       corrigido: parsed.corrigido ?? texto,
@@ -272,33 +292,49 @@ application.post("/api/chat/:slugDaRegiao", async (request, response) => {
       orcamento: analise.orcamento  // baixo | medio | alto | null
     };
 
-    // 4) Criar conversationId se não veio do front
+    // 4) Criar conversationId se não veio do front (modo tolerante a falhas)
+    let conversacaoHabilitada = true;
     if (!conversationId || typeof conversationId !== "string" || !conversationId.trim()) {
       conversationId = randomUUID();
-      const { error: erroCriarConversa } = await supabase.from("conversas").insert({
-        id: conversationId,
-        regiao_id: regiao.id,
-        parceiro_em_foco: null,
-        parceiros_sugeridos: [],
-        ultima_pergunta_usuario: null,
-        ultima_resposta_ia: null
-      });
-      if (erroCriarConversa) {
-        console.error("[SUPABASE] Erro ao criar conversa:", erroCriarConversa);
-        return response.status(500).json({ error: "Erro ao iniciar conversa." });
+      try {
+        const { error: erroCriarConversa } = await supabase.from("conversas").insert({
+          id: conversationId,
+          regiao_id: regiao.id,
+          parceiro_em_foco: null,
+          parceiros_sugeridos: [],
+          ultima_pergunta_usuario: null,
+          ultima_resposta_ia: null
+        });
+        if (erroCriarConversa) {
+          console.error("[SUPABASE] Erro ao criar conversa (seguindo sem estado):", erroCriarConversa);
+          conversacaoHabilitada = false;
+        }
+      } catch (e) {
+        console.error("[SUPABASE] Exceção ao criar conversa (seguindo sem estado):", e);
+        conversacaoHabilitada = false;
       }
     }
 
-    // 5) Carregar conversa atual (para follow-ups)
-    const { data: conversaAtual, error: erroConversa } = await supabase
-      .from("conversas")
-      .select("id, parceiro_em_foco, parceiros_sugeridos")
-      .eq("id", conversationId)
-      .single();
+    // 5) Carregar conversa atual (para follow-ups) — tolerante a falhas
+    let conversaAtual = { id: conversationId, parceiro_em_foco: null, parceiros_sugeridos: [] };
+    if (conversacaoHabilitada) {
+      try {
+        const { data: conv, error: erroConversa } = await supabase
+          .from("conversas")
+          .select("id, parceiro_em_foco, parceiros_sugeridos")
+          .eq("id", conversationId)
+          .single();
 
-    if (erroConversa || !conversaAtual) {
-      console.error("[SUPABASE] Erro ao carregar conversa:", erroConversa);
-      return response.status(404).json({ error: "Conversa não encontrada." });
+        if (erroConversa || !conv) {
+          console.error("[SUPABASE] Erro ao carregar conversa (seguindo sem estado):", erroConversa);
+          conversacaoHabilitada = false;
+        } else {
+          conversaAtual = conv || conversaAtual;
+        }
+      } catch (e) {
+        console.error("[SUPABASE] Exceção ao carregar conversa (seguindo sem estado):", e);
+        conversacaoHabilitada = false;
+      }
     }
 
     // 6) Registrar busca e evento de analytics (não derrubar rota se falhar)
@@ -319,9 +355,9 @@ application.post("/api/chat/:slugDaRegiao", async (request, response) => {
       console.error("[SUPABASE] Falha ao registrar métricas de busca (segue):", e);
     }
 
-    // 7) Follow-ups diretos se houver parceiro em foco
+    // 7) Follow-ups diretos se houver parceiro em foco (apenas se conversa habilitada)
     const intencao = detectarIntencaoDeFollowUp(textoDoUsuario);
-    if (conversaAtual.parceiro_em_foco && intencao !== "nenhuma") {
+    if (conversacaoHabilitada && conversaAtual.parceiro_em_foco && intencao !== "nenhuma") {
       const parceiroAtual = conversaAtual.parceiro_em_foco;
 
       if (intencao === "horario") {
@@ -330,13 +366,17 @@ application.post("/api/chat/:slugDaRegiao", async (request, response) => {
           : "O parceiro não informou horário de funcionamento.";
         const respostaDireta = `Horário de funcionamento de ${parceiroAtual.nome}: ${horario}`;
 
-        await supabase.from("interacoes").insert({
-          regiao_id: regiao.id,
-          conversation_id: conversationId,
-          pergunta_usuario: textoDoUsuario,
-          resposta_ia: respostaDireta,
-          parceiros_sugeridos: conversaAtual.parceiros_sugeridos || []
-        });
+        try {
+          await supabase.from("interacoes").insert({
+            regiao_id: regiao.id,
+            conversation_id: conversationId,
+            pergunta_usuario: textoDoUsuario,
+            resposta_ia: respostaDireta,
+            parceiros_sugeridos: conversaAtual.parceiros_sugeridos || []
+          });
+        } catch (e) {
+          console.error("[SUPABASE] Falha ao registrar interação (segue):", e);
+        }
 
         return response.status(200).json({
           reply: respostaDireta,
@@ -350,13 +390,17 @@ application.post("/api/chat/:slugDaRegiao", async (request, response) => {
         const endereco = parceiroAtual.endereco ? String(parceiroAtual.endereco) : "Endereço não informado.";
         const respostaDireta = `Endereço de ${parceiroAtual.nome}: ${endereco}`;
 
-        await supabase.from("interacoes").insert({
-          regiao_id: regiao.id,
-          conversation_id: conversationId,
-          pergunta_usuario: textoDoUsuario,
-          resposta_ia: respostaDireta,
-          parceiros_sugeridos: conversaAtual.parceiros_sugeridos || []
-        });
+        try {
+          await supabase.from("interacoes").insert({
+            regiao_id: regiao.id,
+            conversation_id: conversationId,
+            pergunta_usuario: textoDoUsuario,
+            resposta_ia: respostaDireta,
+            parceiros_sugeridos: conversaAtual.parceiros_sugeridos || []
+          });
+        } catch (e) {
+          console.error("[SUPABASE] Falha ao registrar interação (segue):", e);
+        }
 
         return response.status(200).json({
           reply: respostaDireta,
@@ -370,13 +414,17 @@ application.post("/api/chat/:slugDaRegiao", async (request, response) => {
         const contato = parceiroAtual.contato ? String(parceiroAtual.contato) : "Contato não informado.";
         const respostaDireta = `Contato de ${parceiroAtual.nome}: ${contato}`;
 
-        await supabase.from("interacoes").insert({
-          regiao_id: regiao.id,
-          conversation_id: conversationId,
-          pergunta_usuario: textoDoUsuario,
-          resposta_ia: respostaDireta,
-          parceiros_sugeridos: conversaAtual.parceiros_sugeridos || []
-        });
+        try {
+          await supabase.from("interacoes").insert({
+            regiao_id: regiao.id,
+            conversation_id: conversationId,
+            pergunta_usuario: textoDoUsuario,
+            resposta_ia: respostaDireta,
+            parceiros_sugeridos: conversaAtual.parceiros_sugeridos || []
+          });
+        } catch (e) {
+          console.error("[SUPABASE] Falha ao registrar interação (segue):", e);
+        }
 
         return response.status(200).json({
           reply: respostaDireta,
@@ -392,13 +440,17 @@ application.post("/api/chat/:slugDaRegiao", async (request, response) => {
           ? `Aqui estão algumas fotos de ${parceiroAtual.nome}.`
           : `Não encontrei fotos de ${parceiroAtual.nome}.`;
 
-        await supabase.from("interacoes").insert({
-          regiao_id: regiao.id,
-          conversation_id: conversationId,
-          pergunta_usuario: textoDoUsuario,
-          resposta_ia: respostaDireta,
-          parceiros_sugeridos: conversaAtual.parceiros_sugeridos || []
-        });
+        try {
+          await supabase.from("interacoes").insert({
+            regiao_id: regiao.id,
+            conversation_id: conversationId,
+            pergunta_usuario: textoDoUsuario,
+            resposta_ia: respostaDireta,
+            parceiros_sugeridos: conversaAtual.parceiros_sugeridos || []
+          });
+        } catch (e) {
+          console.error("[SUPABASE] Falha ao registrar interação (segue):", e);
+        }
 
         return response.status(200).json({
           reply: respostaDireta,
@@ -412,13 +464,17 @@ application.post("/api/chat/:slugDaRegiao", async (request, response) => {
         const faixaDePreco = parceiroAtual.faixa_preco ? String(parceiroAtual.faixa_preco) : "Faixa de preço não informada.";
         const respostaDireta = `Faixa de preço de ${parceiroAtual.nome}: ${faixaDePreco}`;
 
-        await supabase.from("interacoes").insert({
-          regiao_id: regiao.id,
-          conversation_id: conversationId,
-          pergunta_usuario: textoDoUsuario,
-          resposta_ia: respostaDireta,
-          parceiros_sugeridos: conversaAtual.parceiros_sugeridos || []
-        });
+        try {
+          await supabase.from("interacoes").insert({
+            regiao_id: regiao.id,
+            conversation_id: conversationId,
+            pergunta_usuario: textoDoUsuario,
+            resposta_ia: respostaDireta,
+            parceiros_sugeridos: conversaAtual.parceiros_sugeridos || []
+          });
+        } catch (e) {
+          console.error("[SUPABASE] Falha ao registrar interação (segue):", e);
+        }
 
         return response.status(200).json({
           reply: respostaDireta,
@@ -429,8 +485,9 @@ application.post("/api/chat/:slugDaRegiao", async (request, response) => {
       }
     }
 
-    // Follow-up sem foco mas com vários sugeridos
+    // Follow-up sem foco mas com vários sugeridos (só faz sentido se conversa habilitada)
     if (
+      conversacaoHabilitada &&
       !conversaAtual.parceiro_em_foco &&
       intencao !== "nenhuma" &&
       Array.isArray(conversaAtual.parceiros_sugeridos) &&
@@ -439,13 +496,17 @@ application.post("/api/chat/:slugDaRegiao", async (request, response) => {
       const nomes = conversaAtual.parceiros_sugeridos.map((x) => x.nome).slice(0, 5).join(", ");
       const respostaDireta = `Você está se referindo a qual parceiro: ${nomes}?`;
 
-      await supabase.from("interacoes").insert({
-        regiao_id: regiao.id,
-        conversation_id: conversationId,
-        pergunta_usuario: textoDoUsuario,
-        resposta_ia: respostaDireta,
-        parceiros_sugeridos: conversaAtual.parceiros_sugeridos || []
-      });
+      try {
+        await supabase.from("interacoes").insert({
+          regiao_id: regiao.id,
+          conversation_id: conversationId,
+          pergunta_usuario: textoDoUsuario,
+          resposta_ia: respostaDireta,
+          parceiros_sugeridos: conversaAtual.parceiros_sugeridos || []
+        });
+      } catch (e) {
+        console.error("[SUPABASE] Falha ao registrar interação (segue):", e);
+      }
 
       return response.status(200).json({
         reply: respostaDireta,
