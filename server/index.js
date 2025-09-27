@@ -642,7 +642,7 @@ termos = Array.from(new Set(reforcosPorPerfil));
 // (opcional) reforço via Gemini
 if (!DISABLE_GEMINI) {
   try {
-    const modeloKW = geminiClient.getGenerativeModel({ model: "gemini-1.5-flash" });
+    const modeloKW = geminiClient.getGenerativeModel({ model: "gemini-1.5-flash-latest" });
     const promptKW = `
 extraia até 3 palavras-chave de turismo da frase abaixo.
 regras:
@@ -762,7 +762,7 @@ frase: "${textoDoUsuario}"
     // a) Resposta natural sempre vem primeiro
     if (!DISABLE_GEMINI) {
       try {
-        const modeloIA = geminiClient.getGenerativeModel({ model: "gemini-1.5-flash" });
+        const modeloIA = geminiClient.getGenerativeModel({ model: "gemini-1.5-flash-latest" });
         const promptNatural = `
 Você é o BEPIT, concierge local, educado e sincero da região ${regiao.nome}.
 Regras de resposta:
