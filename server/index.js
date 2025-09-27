@@ -605,36 +605,45 @@ application.post("/api/chat/:slugDaRegiao", async (request, response) => {
       }
     }
 
-    // 8) Palavras-chave e termos de reforço
-    logStep("INÍCIO - extração de palavras-chave");
-    let termos = [];
-    const reforcosPorPerfil = [];
-    if (analise?.palavrasChave?.length) {
-      for (const k of analise.palavrasChave) reforcosPorPerfil.push(String(k).toLowerCase());
-    }
-    if (perfilUsuario.companhia === "casal" || perfilUsuario.vibe === "romantico") {
-      reforcosPorPerfil.push("romantico", "jantar", "vista", "pôr do sol", "vinho");
-    }
-    if (perfilUsuario.vibe === "tranquilo") {
-      reforcosPorPerfil.push("tranquilo", "barco privativo", "praia calma", "silencioso");
-    }
-    if (perfilUsuario.vibe === "agitado") {
-      reforcosPorPerfil.push("balada", "música ao vivo", "bar");
-    }
-    if (perfilUsuario.vibe === "aventura") {
-      reforcosPorPerfil.push("trilha", "mergulho", "passeio de barco");
-    }
-    if (perfilUsuario.orcamento === "baixo") {
-      reforcosPorPerfil.push("bom e barato", "popular");
-    }
-    if (perfilUsuario.orcamento === "alto") {
-      reforcosPorPerfil.push("premium", "sofisticado", "menu degustação");
-    }
-    let termos = Array.from(new Set(reforcosPorPerfil));
+    // -----------------------------------------------------------------------
+// 8) Montagem de termos (perfil + IA) para buscar parceiros/dicas
+// -----------------------------------------------------------------------
+logStep("INÍCIO - extração de palavras-chave");
 
-    if (!DISABLE_GEMINI) {
-      try {
-        const promptKW = `
+// declare apenas UMA vez
+let termos = [];
+const reforcosPorPerfil = [];
+
+if (analise?.palavrasChave?.length) {
+  for (const k of analise.palavrasChave) reforcosPorPerfil.push(String(k).toLowerCase());
+}
+if (perfilUsuario.companhia === "casal" || perfilUsuario.vibe === "romantico") {
+  reforcosPorPerfil.push("romantico", "jantar", "vista", "pôr do sol", "vinho");
+}
+if (perfilUsuario.vibe === "tranquilo") {
+  reforcosPorPerfil.push("tranquilo", "barco privativo", "praia calma", "silencioso");
+}
+if (perfilUsuario.vibe === "agitado") {
+  reforcosPorPerfil.push("balada", "música ao vivo", "bar");
+}
+if (perfilUsuario.vibe === "aventura") {
+  reforcosPorPerfil.push("trilha", "mergulho", "passeio de barco");
+}
+if (perfilUsuario.orcamento === "baixo") {
+  reforcosPorPerfil.push("bom e barato", "popular");
+}
+if (perfilUsuario.orcamento === "alto") {
+  reforcosPorPerfil.push("premium", "sofisticado", "menu degustação");
+}
+
+// aqui apenas ATRIBUI, não redeclare
+termos = Array.from(new Set(reforcosPorPerfil));
+
+// (opcional) reforço via Gemini
+if (!DISABLE_GEMINI) {
+  try {
+    const modeloKW = geminiClient.getGenerativeModel({ model: "gemini-1.5-flash" });
+    const promptKW = `
 extraia até 3 palavras-chave de turismo da frase abaixo.
 regras:
 - responda apenas com as palavras separadas por vírgula.
@@ -643,21 +652,24 @@ regras:
 frase: "${textoDoUsuario}"
 `.trim();
 
-        const resultadoKW = await modeloKW.generateContent(promptKW);
-        const textoKW = (await resultadoKW.response.text()).trim();
-        const linhaKW = (textoKW.split("\n")[0] || "").replace(/["'“”‘’]/g, "");
-        const baseKW = linhaKW.split(",").map((x) => x.trim().toLowerCase()).filter(Boolean);
-        const set = new Set(termos);
-        for (const p of baseKW) {
-          if (p && p.length >= 3) set.add(p);
-          if (p && p.endsWith("s") && p.slice(0, -1).length >= 3) set.add(p.slice(0, -1));
-          if (p && !p.endsWith("s") && (p + "s").length >= 3) set.add(p + "s");
-        }
-        termos = Array.from(set);
-      } catch (e) {
-        console.error("[KW Gemini] Falha ao extrair palavras-chave (segue com reforços):", e);
-      }
+    const resultadoKW = await modeloKW.generateContent(promptKW);
+    const textoKW = (await resultadoKW.response.text()).trim();
+    const linhaKW = (textoKW.split("\n")[0] || "").replace(/["'“”‘’]/g, "");
+    const baseKW = linhaKW.split(",").map((x) => x.trim().toLowerCase()).filter(Boolean);
+
+    const set = new Set(termos);
+    for (const p of baseKW) {
+      if (p && p.length >= 3) set.add(p);
+      if (p && p.endsWith("s") && p.slice(0, -1).length >= 3) set.add(p.slice(0, -1));
+      if (p && !p.endsWith("s") && (p + "s").length >= 3) set.add(p + "s");
     }
+    termos = Array.from(set);
+  } catch (e) {
+    console.error("[KW Gemini] Falha ao extrair palavras-chave (segue com reforços):", e);
+  }
+} else {
+  logStep("DISABLE_GEMINI=1 → pulando extração de palavras-chave");
+}
 
     // 9) Buscar itens locais (parceiros e dicas)
     const cidadeIds = cidadeDetectada ? [cidadeDetectada.id] : (cidades || []).map((c) => c.id);
