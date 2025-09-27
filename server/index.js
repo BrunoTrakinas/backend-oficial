@@ -7,6 +7,8 @@
 // - Métricas básicas e proteção contra erros (guard rails)
 // - Entende follow-ups por número ("3") e por nome/categoria (com fuzzy)
 // - Fallback seguro se Gemini estiver desligado ou indisponível
+// - NÃO lista parceiros em saudações; só busca quando há intenção clara
+// - NOVO: trata perguntas gerais (distância/tempo, roteiro de 1 dia) sem “resetar”
 // ============================================================================
 
 import "dotenv/config";
@@ -105,8 +107,40 @@ function salvarConversaMem(conversationId, payload) {
 }
 
 // ============================================================================
-// INTENÇÕES, SELEÇÃO E FUZZY MATCH
+// INTENÇÕES, SAUDAÇÕES, FUZZY E PERGUNTAS GERAIS
 // ============================================================================
+
+// Termos básicos que caracterizam categorias de turismo/serviços
+const CATEGORIAS_GATILHO = [
+  "restaurante", "restaurantes", "pizzaria", "pizzarias", "sorvete", "sorveteria",
+  "praia", "praias", "passeio", "passeios", "trilha", "trilhas", "mergulho",
+  "balada", "bar", "bares", "música ao vivo", "hospedagem", "hotel", "pousada",
+  "carro", "aluguel de carro", "translado", "transfer", "ponto turístico", "pontos turisticos",
+  "churrascaria", "rodízio", "rodizio", "praia calma", "família", "casal", "romântico", "romantico",
+  "aventura", "kids", "criança", "criancas", "parque", "city tour", "buggy", "lancha"
+];
+
+const PALAVRAS_SAUDACAO = [
+  "oi", "olá", "ola", "bom dia", "boa tarde", "boa noite", "eae", "fala", "salve", "opa"
+];
+
+const STOPWORDS = new Set([
+  "geral", "ola", "olá", "oi", "ok", "blz", "beleza", "valeu", "obrigado", "obrigada",
+  "quero", "quero saber", "me ajuda", "me fale", "me diga", "me diz", "diz", "fala",
+  "sobre", "em", "da", "de", "do", "dos", "das", "na", "no", "nos", "nas", "um", "uma", "e"
+]);
+
+function detectarSaudacaoOuNeutro(texto) {
+  const t = String(texto || "").toLowerCase().trim();
+  if (!t) return true;
+  if (PALAVRAS_SAUDACAO.some((p) => t === p || t.startsWith(p))) return true;
+  const temInterrogacao = t.includes("?");
+  const qtdPalavras = t.split(/\s+/).filter(Boolean).length;
+  const temCategoria = CATEGORIAS_GATILHO.some((c) => t.includes(c));
+  if (!temInterrogacao && !temCategoria && qtdPalavras <= 3) return true;
+  return false;
+}
+
 function detectarIntencaoDeFollowUp(textoDoUsuario) {
   const t = String(textoDoUsuario || "").toLowerCase();
 
@@ -122,6 +156,29 @@ function detectarIntencaoDeFollowUp(textoDoUsuario) {
     for (const termo of item.padroes) if (t.includes(termo)) return item.intencao;
   }
   return "nenhuma";
+}
+
+// >>> Detecta perguntas gerais (distância/tempo e “dá pra em 1 dia?”)
+function detectarPerguntaGeral(texto, cidadesLista) {
+  const t = String(texto || "").toLowerCase();
+
+  // distância/tempo
+  const temDist = /(dist[aâ]ncia|km|quil[oô]metros?|quanto\s+tempo|leva\s+quanto|tempo\s+de\s+carro|tempo\s+de\s+uber)/i.test(t);
+
+  // 1 dia / roteiro
+  const temUmDia = /(d(a|á)\s*pr(a|a)|consigo|vale\s+a\s+pena).*(1|um)\s+dia|roteiro\s+de\s+1\s+dia|um\s+dia\s+em/i.test(t);
+
+  // Tenta extrair nomes de cidades conhecidas
+  const cidades = [];
+  for (const c of cidadesLista || []) {
+    const n = String(c.nome).toLowerCase();
+    const s = String(c.slug).toLowerCase();
+    if (t.includes(n) || t.includes(s)) cidades.push(c.nome);
+  }
+
+  if (temDist) return { tipo: "distancia", cidades };
+  if (temUmDia) return { tipo: "itinerario1dia", cidades };
+  return { tipo: null, cidades: [] };
 }
 
 // índice por número/palavra → 0-based
@@ -204,7 +261,7 @@ function tentarAcharParceiroPorNomeOuCategoria(texto, lista) {
       melhor = p;
     }
   }
-  // Threshold conservador para pegar “churascaria” ~ “churrascaria”
+  // Threshold conservador
   return melhorScore >= 0.45 ? melhor : null;
 }
 
@@ -316,6 +373,17 @@ application.post("/api/chat/:slugDaRegiao", async (request, response) => {
       return response.status(400).json({ error: "O campo 'message' é obrigatório e deve ser uma string não vazia." });
     }
 
+    // 0) Saudações e mensagens neutras → NÃO listar parceiros
+    if (detectarSaudacaoOuNeutro(textoDoUsuario)) {
+      const dicaCidades = "Cabo Frio, Arraial do Cabo, Búzios, São Pedro da Aldeia";
+      return response.status(200).json({
+        reply: `Olá! Posso te indicar **restaurantes**, **passeios**, **praias**, **hospedagem** e muito mais.\nDiga o que procura (ex.: *restaurantes em Cabo Frio*, *passeios em Arraial do Cabo*). Se preferir, posso filtrar por cidade (${dicaCidades}).`,
+        interactionId: null,
+        photoLinks: [],
+        conversationId: conversationId || null
+      });
+    }
+
     // 1) Região
     const { data: regiao, error: erroRegiao } = await supabase
       .from("regioes")
@@ -335,6 +403,82 @@ application.post("/api/chat/:slugDaRegiao", async (request, response) => {
     if (erroCidades) {
       console.error("[SUPABASE] Erro ao carregar cidades:", erroCidades);
       return response.status(500).json({ error: "Erro ao carregar cidades." });
+    }
+
+    // 2.1) Detecta perguntas gerais (distância/tempo, 1 dia) e responde antes de listar parceiros
+    const pg = detectarPerguntaGeral(textoDoUsuario, cidades);
+    if (pg.tipo) {
+      let respostaDireta = "";
+
+      if (pg.tipo === "distancia") {
+        // Fallback local sincero + curto (Cabo Frio ↔ Arraial do Cabo é ~15 km, 25–35 min sem trânsito)
+        const temCF = /cabo\s*frio/i.test(textoDoUsuario);
+        const temAR = /arraial\s*(do|de)\s*cabo/i.test(textoDoUsuario);
+        const sugestaoLocal = temCF && temAR
+          ? "Entre Cabo Frio e Arraial do Cabo são cerca de **15 km**; de carro costuma levar **25–35 min** fora de pico (pode variar com trânsito/feriados)."
+          : null;
+
+        if (!DISABLE_GEMINI) {
+          try {
+            const modeloIA = geminiClient.getGenerativeModel({ model: "gemini-1.5-flash" });
+            const listaCidadesNomes = (cidades || []).map((c) => c.nome).join(", ");
+            const prompt = `
+Você é um concierge local. Responda DIRETO e CURTO sobre distância/tempo entre cidades da região (${listaCidadesNomes}).
+- Dê valores aproximados (km) e tempo típico de carro em condições normais.
+- Seja sincero: trânsito, feriados e obras afetam bastante.
+- Não invente leis ou dados exatos; use "cerca de", "em média".
+Pergunta: "${textoDoUsuario}"
+`.trim();
+            const respIA = await modeloIA.generateContent(prompt);
+            respostaDireta = (respIA.response.text() || "").trim();
+          } catch {
+            respostaDireta = sugestaoLocal || "É pertinho: as cidades aqui ficam a poucos quilômetros; de carro leva em geral menos de 1 hora, variando com o trânsito.";
+          }
+        } else {
+          respostaDireta = sugestaoLocal || "É pertinho: as cidades aqui ficam a poucos quilômetros; de carro leva em geral menos de 1 hora, variando com o trânsito.";
+        }
+      }
+
+      if (pg.tipo === "itinerario1dia") {
+        if (!DISABLE_GEMINI) {
+          try {
+            const modeloIA = geminiClient.getGenerativeModel({ model: "gemini-1.5-flash" });
+            const prompt = `
+Você é um concierge local. Monte um roteiro RESUMIDO de 1 dia (manhã, tarde, final de tarde) para as cidades desta região.
+Regras:
+- 3 a 5 bullets práticos (praias/passeios mais acessíveis), mencione "chegar cedo", "estacionamento", "vento/mar".
+- Finalize convidando o usuário a pedir **indicações de parceiros** (almoço/passeio/foto).
+Pergunta: "${textoDoUsuario}"
+`.trim();
+            const respIA = await modeloIA.generateContent(prompt);
+            respostaDireta = (respIA.response.text() || "").trim();
+          } catch {
+            respostaDireta = "Dá sim: chegue cedo para aproveitar praia mais vazia, faça um passeio de barco à tarde e finalize no pôr do sol. Se quiser, te indico almoço e um passeio certificado.";
+          }
+        } else {
+          respostaDireta = "Dá sim: chegue cedo para aproveitar praia mais vazia, faça um passeio de barco à tarde e finalize no pôr do sol. Se quiser, te indico almoço e um passeio certificado.";
+        }
+      }
+
+      // Registro best-effort
+      try {
+        await supabase.from("eventos_analytics").insert({
+          regiao_id: regiao.id,
+          cidade_id: null,
+          conversation_id: conversationId || null,
+          tipo_evento: "general_info",
+          payload: { pergunta: textoDoUsuario, tipo: pg.tipo, cidades_detectadas: pg.cidades }
+        });
+      } catch {}
+
+      // Resposta direta + ponte amigável para parceiros
+      const ponte = "Se quiser, indico **restaurantes/passeios** confiáveis e com benefício BEPIT.";
+      return response.status(200).json({
+        reply: `${respostaDireta}\n\n${ponte}`,
+        interactionId: null,
+        photoLinks: [],
+        conversationId: conversationId || null
+      });
     }
 
     // 3) Cidade pelo texto
@@ -410,11 +554,10 @@ application.post("/api/chat/:slugDaRegiao", async (request, response) => {
       console.error("[SUPABASE] Falha ao registrar métricas de busca (segue):", e);
     }
 
-    // 7) intenção
+    // 7) intenção (detalhes do foco atual)
     const intencao = detectarIntencaoDeFollowUp(textoDoUsuario);
 
-    // 7.1 Permitir troca/definição de foco por número ou nome (mesmo com foco já definido),
-    // desde que a intenção não seja de detalhe direto (horário/endereço/contato/fotos/preço)
+    // 7.1 Troca/definição de foco por número/nome
     const candidatos = Array.isArray(conversaAtual.parceiros_sugeridos) ? conversaAtual.parceiros_sugeridos : [];
     if (candidatos.length > 0 && intencao === "nenhuma") {
       let escolhido = null;
@@ -526,10 +669,11 @@ application.post("/api/chat/:slugDaRegiao", async (request, response) => {
       }
     }
 
-    // 8) Buscar itens (parceiros/dicas)
+    // 8) Montagem de termos de busca (com filtros)
     logStep("INÍCIO - extração de palavras-chave");
     let termos = [];
 
+    // Reforços por perfil inferido
     const reforcosPorPerfil = [];
     if (analise?.palavrasChave?.length) for (const k of analise.palavrasChave) reforcosPorPerfil.push(String(k).toLowerCase());
     if (perfilUsuario.companhia === "casal" || perfilUsuario.vibe === "romantico") reforcosPorPerfil.push("romantico", "jantar", "vista", "pôr do sol", "vinho");
@@ -538,7 +682,12 @@ application.post("/api/chat/:slugDaRegiao", async (request, response) => {
     if (perfilUsuario.vibe === "aventura") reforcosPorPerfil.push("trilha", "mergulho", "passeio de barco");
     if (perfilUsuario.orcamento === "baixo") reforcosPorPerfil.push("bom e barato", "popular");
     if (perfilUsuario.orcamento === "alto") reforcosPorPerfil.push("premium", "sofisticado", "menu degustação");
-    termos = Array.from(new Set([...reforcosPorPerfil]));
+
+    // Palavras diretamente do texto se baterem com categorias
+    const tlower = textoMinusculo;
+    for (const c of CATEGORIAS_GATILHO) if (tlower.includes(c)) reforcosPorPerfil.push(c);
+
+    termos = Array.from(new Set(reforcosPorPerfil.filter((w) => w && !STOPWORDS.has(w))));
 
     if (!DISABLE_GEMINI) {
       try {
@@ -548,7 +697,8 @@ extraia até 3 palavras-chave de turismo da frase abaixo.
 regras:
 - responda apenas com as palavras separadas por vírgula.
 - tudo em minúsculas, sem explicações.
-- se não achar nada, responda "geral".
+- evite termos genéricos como "geral", "ola", "oi".
+- se não achar nada útil, responda "nenhuma".
 frase: "${textoDoUsuario}"
 `.trim();
 
@@ -559,6 +709,7 @@ frase: "${textoDoUsuario}"
 
         const set = new Set(termos);
         for (const p of baseKW) {
+          if (!p || p === "nenhuma" || STOPWORDS.has(p)) continue;
           if (p && p.length >= 3) set.add(p);
           if (p && p.endsWith("s") && p.slice(0, -1).length >= 3) set.add(p.slice(0, -1));
           if (p && !p.endsWith("s") && (p + "s").length >= 3) set.add(p + "s");
@@ -572,7 +723,18 @@ frase: "${textoDoUsuario}"
       logStep("DISABLE_GEMINI=1 → pulando extração de palavras-chave");
     }
 
-    // 9) Query de parceiros/dicas
+    // Se ainda não houver termos úteis, peça clarificação
+    if (termos.length === 0 && detectarIntencaoDeFollowUp(textoDoUsuario) === "nenhuma") {
+      const dicaCidades = (cidades || []).map((c) => c.nome).join(", ");
+      return response.status(200).json({
+        reply: `Entendi. Para te ajudar melhor, diga o que você busca (ex.: *pizzarias em Búzios*, *passeio de lancha em Arraial do Cabo*, *praias tranquilas para família*). Posso filtrar por cidade: ${dicaCidades}.`,
+        interactionId: null,
+        photoLinks: [],
+        conversationId
+      });
+    }
+
+    // 9) Query de parceiros/dicas (somente quando termos úteis existirem)
     const cidadeIds = cidadeDetectada ? [cidadeDetectada.id] : (cidades || []).map((c) => c.id);
 
     let consulta = supabase
@@ -677,6 +839,7 @@ Regras:
 4) Respostas curtas e diretas (2 a 4 frases). Cite benefícios BEPIT quando existirem.
 5) Fale apenas sobre turismo e serviços desta região.
 6) Sempre que listar 2+ opções, **incentive a seleção por número ou nome** explicitamente.
+7) Se NÃO houver itens, peça **uma direção específica** em vez de repetir listas vazias.
 
 [Perfil do usuário]
 companhia: ${perfilUsuario.companhia || "desconhecida"}
@@ -862,7 +1025,7 @@ application.post("/api/admin/parceiros", exigirAdminKey, async (request, respons
       tags: Array.isArray(restante.tags) ? restante.tags : null,
       horario_funcionamento: restante.horario_funcionamento || null,
       faixa_preco: restante.faixa_preco || null,
-      fotos_parceiros: Array.isArray(restante.fotos_parceiros) ? restante.fotos_parceiros : null,
+      fotos_parceiros: Array.isArray(restante.fotos_parceiros) ? restante.fotos_parceiros : (Array.isArray(restante.fotos) ? restante.fotos : null),
       ativo: restante.ativo !== false
     };
 
@@ -921,7 +1084,7 @@ application.put("/api/admin/parceiros/:id", exigirAdminKey, async (req, res) => 
       tags: Array.isArray(body.tags) ? body.tags : null,
       horario_funcionamento: body.horario_funcionamento ?? null,
       faixa_preco: body.faixa_preco ?? null,
-      fotos_parceiros: Array.isArray(body.fotos_parceiros) ? body.fotos_parceiros : null,
+      fotos_parceiros: Array.isArray(body.fotos_parceiros) ? body.fotos_parceiros : (Array.isArray(body.fotos) ? body.fotos : null),
       ativo: body.ativo !== false
     };
 
