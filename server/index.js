@@ -18,10 +18,10 @@ import { supabase } from "../lib/supabaseClient.js";
 const application = express();
 const servidorPorta = process.env.PORT || 3002;
 
-// Origens permitidas (ajuste aqui se seu domínio mudar)
-// CORS flexível p/ localhost e Netlify (produção + previews)
+// --------------------------------- CORS ------------------------------------
+// CORS flexível para localhost e Netlify (produção + previews)
 const allowOrigin = (origin) => {
-  if (!origin) return true; // permite Postman/cURL
+  if (!origin) return true; // permite Postman/cURL sem Origin
 
   try {
     const url = new URL(origin);
@@ -42,23 +42,6 @@ const allowOrigin = (origin) => {
   }
 };
 
-// ---- ROTA DE LISTA DE PARCEIROS (teste simples) ----
-application.get("/api/parceiros", async (req, res) => {
-  try {
-    const { data, error } = await supabase
-      .from("parceiros")
-      .select("id, nome, categoria")
-      .eq("ativo", true)
-      .limit(20);
-
-    if (error) throw error;
-    res.json({ parceiros: data });
-  } catch (err) {
-    console.error("Erro Supabase:", err);
-    res.status(500).json({ error: "Erro ao buscar parceiros" });
-  }
-});
-
 application.use(
   cors({
     origin: (origin, cb) => (allowOrigin(origin) ? cb(null, true) : cb(new Error("CORS bloqueado para essa origem."))),
@@ -66,17 +49,20 @@ application.use(
   })
 );
 
+// OPTIONS preflight
 application.options("*", cors());
+
+// Body parser JSON
 application.use(express.json());
 
-// Cliente Gemini
+// ------------------------------- GEMINI -------------------------------------
 const geminiClient = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 // ===== DEBUG/SAFE MODE =====
 // Ative DISABLE_GEMINI=1 no .env para pular chamadas à IA (útil p/ testes)
 const DISABLE_GEMINI = process.env.DISABLE_GEMINI === "1";
 
-// Helpers de log
+// ------------------------------ HELPERS -------------------------------------
 function logStep(label, extra = null) {
   const time = new Date().toISOString();
   if (extra !== null && extra !== undefined) {
@@ -94,6 +80,17 @@ function slugify(texto) {
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/(^-|-$)+/g, "");
+}
+
+// ============================================================================
+// MIDDLEWARE: protege rotas de admin com chave no header X-Admin-Key
+// ============================================================================
+function exigirAdminKey(req, res, next) {
+  const header = req.headers["x-admin-key"];
+  if (!header || header !== process.env.ADMIN_API_KEY) {
+    return res.status(401).json({ error: "admin key inválida ou ausente" });
+  }
+  next();
 }
 
 // ------------------------ Healthcheck ------------------------
@@ -668,7 +665,7 @@ ${contextoDeItens}
       textoIA = montarRespostaFallback({ regiao, cidadeDetectada, itens, listaCidades });
     }
 
-    // 13) Métrica de visualização do parceiro em foco (não derrubar rota se falhar)
+    // 13) Métrica de visualização do parceiro em foco (não derrubar se falhar)
     try {
       if (parceiroEmFoco?.id) {
         const { data: registroView, error: errSelView } = await supabase
@@ -1199,6 +1196,23 @@ application.get("/api/admin/logs", exigirAdminKey, async (req, res) => {
   } catch (e) {
     console.error("[/api/admin/logs] erro inesperado:", e);
     return res.status(500).json({ error: "erro interno" });
+  }
+});
+
+// --------------------- ROTA DE LISTA DE PARCEIROS (teste simples) ---------------------
+application.get("/api/parceiros", async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from("parceiros")
+      .select("id, nome, categoria")
+      .eq("ativo", true)
+      .limit(20);
+
+    if (error) throw error;
+    res.json({ parceiros: data });
+  } catch (err) {
+    console.error("[/api/parceiros] erro:", err);
+    res.status(500).json({ error: "Erro ao buscar parceiros" });
   }
 });
 
