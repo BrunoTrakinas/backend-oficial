@@ -52,7 +52,7 @@ application.use(express.json());
 
 // ------------------------------- GEMINI -------------------------------------
 const geminiClient = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const DISABLE_GEMINI = process.env.DISABLE_GEMINI === "0";
+const DISABLE_GEMINI = process.env.DISABLE_GEMINI === "1";
 
 // ------------------------------ HELPERS -------------------------------------
 function logStep(label, extra = null) {
